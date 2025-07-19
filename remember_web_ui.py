@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-🔗 Remember Web UI - Fixed Batch Processing + File Viewer
-Complete web interface for Remember with working batch processing and file popup viewer
+🔗 Remember Web UI - With Integrated URL Extraction + Real-Time Progress
+Complete web interface with extraction pipeline and sick progress tracking
 """
 
 import sys
 import os
+import asyncio
 from pathlib import Path
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -16,13 +17,20 @@ import json
 from typing import List, Dict, Optional, Any
 from datetime import datetime
 import chromadb
+import requests
+import time
+import random
+import re
+from bs4 import BeautifulSoup
+from readability import Document
+import fitz
 
 # Add remember system to path
 sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 try:
     from groq_client import GroqClient
-    from core.database import get_client
+    from core.database import get_client, import_extraction_session
     from commands.legal_handler import LegalHandler
     from commands.command_registry import CommandRegistry
 except ImportError as e:
@@ -40,6 +48,20 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 groq_client = GroqClient()
 legal_handler = LegalHandler()
 command_registry = CommandRegistry()
+
+# Global progress tracking
+extraction_progress = {
+    "active": False,
+    "total_urls": 0,
+    "current_index": 0,
+    "current_url": "",
+    "success_count": 0,
+    "failed_count": 0,
+    "total_chars": 0,
+    "start_time": None,
+    "status": "ready",
+    "results": []
+}
 
 print(f"🔗 Remember Web UI initialized")
 
@@ -227,10 +249,11 @@ async def serve_remember_ui():
         .btn.primary { background: #0066cc; color: white; }
         .btn.legal { background: #8B4513; color: white; border-color: #D2691E; }
         .btn.batch { background: #006600; color: white; border-color: #00ff00; }
+        .btn.extract { background: #ff4400; color: white; border-color: #ff6600; }
         .btn:disabled { opacity: 0.3; cursor: not-allowed; }
         
         .action-bar { 
-            display: grid; grid-template-columns: 1fr 1fr 1fr; 
+            display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; 
             gap: 10px; padding: 15px 0; border-top: 1px solid #333; 
         }
         
@@ -253,21 +276,81 @@ async def serve_remember_ui():
         .disconnected { background: #ff0000; }
         .processing { background: #ff8000; }
         
-        .batch-progress {
-            background: #1a1a1a; border: 1px solid #333;
-            padding: 10px; margin: 10px 0; border-radius: 4px;
-            display: none;
+        /* EXTRACTION PROGRESS OVERLAY */
+        .extraction-overlay {
+            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.95); z-index: 1000;
+            display: none; flex-direction: column; justify-content: center; align-items: center;
+        }
+        
+        .progress-container {
+            background: #1a1a1a; border: 2px solid #00ff00; border-radius: 10px;
+            padding: 30px; width: 80%; max-width: 800px; text-align: center;
+        }
+        
+        .progress-title {
+            font-size: 24px; color: #00ff00; margin-bottom: 20px;
+            text-shadow: 0 0 10px #00ff00;
+        }
+        
+        .progress-stats {
+            display: grid; grid-template-columns: 1fr 1fr 1fr 1fr;
+            gap: 20px; margin-bottom: 20px;
+        }
+        
+        .stat-box {
+            background: #333; border: 1px solid #555; border-radius: 5px;
+            padding: 10px; text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 20px; font-weight: bold; color: #00ff00;
+        }
+        
+        .stat-label {
+            font-size: 10px; color: #888; margin-top: 5px;
+        }
+        
+        .current-url {
+            background: #2a2a2a; border: 1px solid #555; border-radius: 5px;
+            padding: 15px; margin-bottom: 20px; text-align: left;
+        }
+        
+        .url-label {
+            font-size: 12px; color: #888; margin-bottom: 5px;
+        }
+        
+        .url-text {
+            font-size: 11px; color: #00ff00; word-break: break-all;
+        }
+        
+        .progress-bar-container {
+            background: #333; border-radius: 10px; height: 20px;
+            margin-bottom: 20px; overflow: hidden; position: relative;
         }
         
         .progress-bar {
-            background: #333; height: 20px; border-radius: 2px;
-            margin: 5px 0; overflow: hidden;
+            background: linear-gradient(90deg, #ff4400, #ff6600, #00ff00);
+            height: 100%; transition: width 0.5s ease; border-radius: 10px;
+            box-shadow: 0 0 20px rgba(0,255,0,0.5);
         }
         
-        .progress-fill {
-            background: #00ff00; height: 100%; 
-            transition: width 0.3s ease;
+        .progress-text {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            font-size: 12px; font-weight: bold; color: #000; text-shadow: 1px 1px 2px #fff;
         }
+        
+        .time-stats {
+            display: flex; justify-content: space-between; font-size: 12px; color: #888;
+        }
+        
+        .cancel-btn {
+            background: #ff0000; color: white; border: 1px solid #ff4444;
+            padding: 10px 20px; border-radius: 5px; cursor: pointer;
+            margin-top: 20px;
+        }
+        
+        .cancel-btn:hover { background: #ff4444; }
     </style>
 </head>
 <body>
@@ -279,6 +362,50 @@ async def serve_remember_ui():
             <span class="status-indicator connected"></span>ChromaDB Connected
             <span style="margin: 0 20px;">|</span>
             <span id="system-status">System Ready</span>
+        </div>
+    </div>
+    
+    <!-- EXTRACTION PROGRESS OVERLAY -->
+    <div class="extraction-overlay" id="extraction-overlay">
+        <div class="progress-container">
+            <div class="progress-title">🚀 EXTRACTING LEGAL RESEARCH</div>
+            
+            <div class="progress-stats">
+                <div class="stat-box">
+                    <div class="stat-value" id="progress-current">0</div>
+                    <div class="stat-label">CURRENT</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="progress-total">0</div>
+                    <div class="stat-label">TOTAL</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="progress-success">0</div>
+                    <div class="stat-label">SUCCESS ✅</div>
+                </div>
+                <div class="stat-box">
+                    <div class="stat-value" id="progress-failed">0</div>
+                    <div class="stat-label">FAILED ❌</div>
+                </div>
+            </div>
+            
+            <div class="current-url">
+                <div class="url-label">📄 Currently Processing:</div>
+                <div class="url-text" id="current-url-text">Initializing...</div>
+            </div>
+            
+            <div class="progress-bar-container">
+                <div class="progress-bar" id="main-progress-bar" style="width: 0%"></div>
+                <div class="progress-text" id="progress-percentage">0%</div>
+            </div>
+            
+            <div class="time-stats">
+                <span>⏱️ Elapsed: <span id="elapsed-time">0s</span></span>
+                <span>📊 Content: <span id="total-content">0 chars</span></span>
+                <span>🎯 ETA: <span id="eta-time">Calculating...</span></span>
+            </div>
+            
+            <button class="cancel-btn" onclick="cancelExtraction()">❌ Cancel Extraction</button>
         </div>
     </div>
     
@@ -314,22 +441,13 @@ async def serve_remember_ui():
         <!-- File Browser Panel -->
         <div class="file-browser">
             <div class="panel-header">📁 File Explorer</div>
-            <div style="margin-bottom: 15px; display: flex; gap: 5px;">
+            <div style="margin-bottom: 15px; display: flex; gap: 5px; flex-wrap: wrap;">
+                <button class="btn extract" id="extract-urls-btn">
+                    🚀 Extract URLs
+                </button>
                 <button class="btn batch" id="batch-process-btn" disabled>
                     Batch Process All
                 </button>
-            </div>
-            
-            <div class="batch-progress" id="batch-progress">
-                <div style="font-size: 11px; margin-bottom: 5px;">
-                    Processing: <span id="current-file-name">Loading...</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="progress-fill"></div>
-                </div>
-                <div style="font-size: 10px; color: #888;">
-                    <span id="progress-text">0/0 files processed</span>
-                </div>
             </div>
             
             <div id="file-list">Select a database first</div>
@@ -387,13 +505,14 @@ async def serve_remember_ui():
                     <div class="message-content">🎯 Welcome to Remember Legal AI War Room
 
 🔗 Ready to process your legal research with bulletproof infrastructure:
-• Deck rotation through 13 Groq API keys
-• Mobile/residential proxy rotation  
-• Auto-chunking for large documents
-• Master context management
-• Batch processing capabilities
+- Deck rotation through 13 Groq API keys
+- Mobile/residential proxy rotation  
+- Auto-chunking for large documents
+- Master context management
+- Batch processing capabilities
+- URL extraction with real-time progress
 
-Select a database and files to begin analysis.</div>
+Click "🚀 Extract URLs" to scrape from urls.txt and auto-import to database!</div>
                 </div>
             </div>
             
@@ -413,6 +532,9 @@ Select a database and files to begin analysis.</div>
                 <button class="btn" id="export-results-btn" disabled>
                     Export Results
                 </button>
+                <button class="btn" id="refresh-files-btn" disabled>
+                    Refresh Files
+                </button>
             </div>
         </div>
     </div>
@@ -423,6 +545,7 @@ Select a database and files to begin analysis.</div>
         let availableDatabases = [];
         let processingMode = false;
         let allFiles = [];
+        let extractionInterval = null;
 
         // Initialize
         loadDatabases();
@@ -434,6 +557,8 @@ Select a database and files to begin analysis.</div>
         });
         document.getElementById('batch-process-btn').addEventListener('click', startBatchProcess);
         document.getElementById('legal-analyze-btn').addEventListener('click', startLegalAnalysis);
+        document.getElementById('extract-urls-btn').addEventListener('click', startExtraction);
+        document.getElementById('refresh-files-btn').addEventListener('click', refreshFiles);
         
         async function loadDatabases() {
             try {
@@ -481,6 +606,7 @@ Select a database and files to begin analysis.</div>
             
             // Enable controls
             document.getElementById('batch-process-btn').disabled = false;
+            document.getElementById('refresh-files-btn').disabled = false;
             updateCurrentContext();
         }
         
@@ -493,6 +619,13 @@ Select a database and files to begin analysis.</div>
             } catch (error) {
                 document.getElementById('file-list').innerHTML = 
                     '<div style="color: red;">Error loading files</div>';
+            }
+        }
+        
+        async function refreshFiles() {
+            if (currentDatabase) {
+                await loadFiles(currentDatabase);
+                addMessage('system', `🔄 Refreshed files for ${currentDatabase}`);
             }
         }
         
@@ -579,776 +712,484 @@ Select a database and files to begin analysis.</div>
             return contexts;
         }
         
-        async function sendMessage() {
-            const userInput = document.getElementById('user-input');
-            const message = userInput.value.trim();
-            if (!message || !currentDatabase || selectedFiles.length === 0) return;
-            
-            addMessage('user', message);
-            userInput.value = '';
-            
-            // Prepare request
-            const requestData = {
-                database: currentDatabase,
-                files: selectedFiles,
-                message: message,
-                provider: document.getElementById('provider-select').value,
-                api_key: document.getElementById('api-key-select').value,
-                context_mode: document.getElementById('context-mode').value,
-                master_contexts: getSelectedMasterContexts()
-            };
+        // EXTRACTION FUNCTIONALITY
+        async function startExtraction() {
+            addMessage('system', '🚀 Starting URL extraction from urls.txt...');
             
             try {
-                addMessage('system', '🔄 Processing through Remember infrastructure...');
-                
-                const response = await fetch('/api/chat', {
+                const response = await fetch('/api/start_extraction', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(requestData)
+                    body: JSON.stringify({})
                 });
                 
                 if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.detail || 'Server error');
+                    throw new Error('Failed to start extraction');
                 }
                 
                 const data = await response.json();
-                addMessage('assistant', data.response);
                 
-                if (data.debug_info) {
-                    addMessage('system', `Debug: ${data.debug_info}`);
-                }
-                
-            } catch (error) {
-                addMessage('system', `❌ Error: ${error.message}`);
-            }
-        }
-        
-        async function startBatchProcess() {
-            if (!currentDatabase || allFiles.length === 0) return;
-            
-            const prompt = window.prompt('Enter analysis prompt for batch processing:', 
-                'Analyze this document for legal significance, service defects, and key arguments.');
-            
-            if (!prompt) return;
-            
-            // Show progress
-            const progressDiv = document.getElementById('batch-progress');
-            progressDiv.style.display = 'block';
-            
-            addMessage('system', `🚀 Starting batch processing of ${allFiles.length} documents in ${currentDatabase}...`);
-            
-            const requestData = {
-                database: currentDatabase,
-                analysis_prompt: prompt,
-                processing_mode: document.getElementById('processing-mode').value,
-                provider: document.getElementById('provider-select').value,
-                api_key: document.getElementById('api-key-select').value
-            };
-            
-            try {
-                const response = await fetch('/api/batch_process', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(requestData)
-                });
-                
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.detail || 'Server error');
-                }
-                
-                const data = await response.json();
-                addMessage('assistant', data.result);
-                
-                // Hide progress
-                progressDiv.style.display = 'none';
-                
-            } catch (error) {
-                addMessage('system', `❌ Batch process error: ${error.message}`);
-                progressDiv.style.display = 'none';
-            }
-        }
-        
-        async function startLegalAnalysis() {
-            if (!currentDatabase || selectedFiles.length === 0) return;
-            
-            addMessage('system', '⚖️ Starting legal analysis on selected documents...');
-            
-            const message = 'Perform comprehensive legal analysis focusing on procedural issues, service defects, and statutory violations.';
-            
-            const requestData = {
-                database: currentDatabase,
-                files: selectedFiles,
-                message: message,
-                provider: document.getElementById('provider-select').value,
-                api_key: document.getElementById('api-key-select').value,
-                context_mode: 'fresh',
-                master_contexts: ['service_defects', 'tpa_violations', 'court_procedure']
-            };
-            
-            try {
-                const response = await fetch('/api/chat', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(requestData)
-                });
-                
-                if (!response.ok) {
-                    const errorData = await response.json();
-                    throw new Error(errorData.detail || 'Server error');
-                }
-                
-                const data = await response.json();
-                addMessage('assistant', data.response);
-                
-            } catch (error) {
-                addMessage('system', `❌ Legal analysis error: ${error.message}`);
-            }
-        }
-        
-        function addMessage(role, content) {
-            const chatMessages = document.getElementById('chat-messages');
-            const messageDiv = document.createElement('div');
-            messageDiv.className = `message ${role}`;
-            
-            const roleSpan = document.createElement('div');
-            roleSpan.className = 'message-role';
-            roleSpan.textContent = role.toUpperCase();
-            
-            const contentDiv = document.createElement('div');
-            contentDiv.className = 'message-content';
-            contentDiv.textContent = content;
-            
-            messageDiv.appendChild(roleSpan);
-            messageDiv.appendChild(contentDiv);
-            
-            // Add save button for assistant responses
-            if (role === 'assistant' && !content.startsWith('❌')) {
-                const saveBtn = document.createElement('button');
-                saveBtn.textContent = '💾 Save Analysis';
-                saveBtn.className = 'btn';
-                saveBtn.style.marginTop = '10px';
-                saveBtn.onclick = () => saveAnalysis(content);
-                messageDiv.appendChild(saveBtn);
-            }
-            
-            chatMessages.appendChild(messageDiv);
-            chatMessages.scrollTop = chatMessages.scrollHeight;
-        }
-        
-        async function saveAnalysis(content) {
-            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            const filename = `legal_analysis_${timestamp}.md`;
-            
-            try {
-                const response = await fetch('/api/save_analysis', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        filename: filename,
-                        content: content,
-                        database: currentDatabase,
-                        files: selectedFiles
-                    })
-                });
-                
-                const data = await response.json();
                 if (data.success) {
-                    addMessage('system', `✅ Analysis saved: ${filename}`);
+                    showExtractionOverlay();
+                    startProgressTracking();
+                    addMessage('system', `📋 Found ${data.total_urls} URLs to extract`);
+                } else {
+                    addMessage('system', `❌ Error: ${data.error}`);
                 }
                 
             } catch (error) {
-                addMessage('system', `❌ Save error: ${error.message}`);
+                addMessage('system', `❌ Extraction error: ${error.message}`);
             }
         }
-    </script>
+        
+        function showExtractionOverlay() {
+            document.getElementById('extraction-overlay').style.display = 'flex';
+        }
+        
+        function hideExtractionOverlay() {
+            document.getElementById('extraction-overlay').style.display = 'none';
+        }
+        
+        function startProgressTracking() {
+            extractionInterval = setInterval(updateProgress, 500);
+        }
+        
+        async function updateProgress() {
+            try {
+                const response = await fetch('/api/extraction_progress');
+                const progress = await response.json();
+                
+                if (!progress.active) {
+                    clearInterval(extractionInterval);
+                    hideExtractionOverlay();
+                    
+                    addMessage('system', `✅ Extraction completed!`);
+                    addMessage('system', `📊 Results: ${progress.success_count}/${progress.total_urls} successful`);
+                    
+                    if (currentDatabase) {
+                        await refreshFiles();
+                    }
+                    return;
+                }
+                
+                // Update progress display
+                const percentage = Math.round((progress.current_index / progress.total_urls) * 100);
+                
+                document.getElementById('progress-current').textContent = progress.current_index;
+                document.getElementById('progress-total').textContent = progress.total_urls;
+                document.getElementById('progress-success').textContent = progress.success_count;
+                document.getElementById('progress-failed').textContent = progress.failed_count;
+                
+                document.getElementById('current-url-text').textContent = progress.current_url || 'Processing...';
+                document.getElementById('main-progress-bar').style.width = percentage + '%';
+                document.getElementById('progress-percentage').textContent = percentage + '%';
+                // Time calculations
+               if (progress.start_time) {
+                   const elapsed = (Date.now() - new Date(progress.start_time)) / 1000;
+                   document.getElementById('elapsed-time').textContent = formatTime(elapsed);
+                   
+                   if (progress.current_index > 0) {
+                       const avgTimePerUrl = elapsed / progress.current_index;
+                       const remaining = (progress.total_urls - progress.current_index) * avgTimePerUrl;
+                       document.getElementById('eta-time').textContent = formatTime(remaining);
+                   }
+               }
+               
+               document.getElementById('total-content').textContent = formatBytes(progress.total_chars);
+               
+           } catch (error) {
+               console.error('Progress update error:', error);
+           }
+       }
+       
+       function formatTime(seconds) {
+           if (seconds < 60) return Math.round(seconds) + 's';
+           const minutes = Math.floor(seconds / 60);
+           const secs = Math.round(seconds % 60);
+           return `${minutes}m ${secs}s`;
+       }
+       
+       function formatBytes(bytes) {
+           if (bytes < 1024) return bytes + ' chars';
+           if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + 'KB';
+           return (bytes / (1024 * 1024)).toFixed(1) + 'MB';
+       }
+       
+       async function cancelExtraction() {
+           try {
+               await fetch('/api/cancel_extraction', { method: 'POST' });
+               clearInterval(extractionInterval);
+               hideExtractionOverlay();
+               addMessage('system', '❌ Extraction cancelled by user');
+           } catch (error) {
+               console.error('Cancel error:', error);
+           }
+       }
+       
+       async function sendMessage() {
+           const userInput = document.getElementById('user-input');
+           const message = userInput.value.trim();
+           if (!message || !currentDatabase || selectedFiles.length === 0) return;
+           
+           addMessage('user', message);
+           userInput.value = '';
+           
+           // Prepare request
+           const requestData = {
+               database: currentDatabase,
+               files: selectedFiles,
+               message: message,
+               provider: document.getElementById('provider-select').value,
+               api_key: document.getElementById('api-key-select').value,
+               context_mode: document.getElementById('context-mode').value,
+               master_contexts: getSelectedMasterContexts()
+           };
+           
+           try {
+               addMessage('system', '🔄 Processing through Remember infrastructure...');
+               
+               const response = await fetch('/api/chat', {
+                   method: 'POST',
+                   headers: {'Content-Type': 'application/json'},
+                   body: JSON.stringify(requestData)
+               });
+               
+               if (!response.ok) {
+                   const errorData = await response.json();
+                   throw new Error(errorData.detail || 'Server error');
+               }
+               
+               const data = await response.json();
+               addMessage('assistant', data.response);
+               
+               if (data.debug_info) {
+                   addMessage('system', `Debug: ${data.debug_info}`);
+               }
+               
+           } catch (error) {
+               addMessage('system', `❌ Error: ${error.message}`);
+           }
+       }
+       
+       async function startBatchProcess() {
+           if (!currentDatabase || allFiles.length === 0) return;
+           
+           const prompt = window.prompt('Enter analysis prompt for batch processing:', 
+               'Analyze this document for legal significance, service defects, and key arguments.');
+           
+           if (!prompt) return;
+           
+           addMessage('system', `🚀 Starting batch processing of ${allFiles.length} documents in ${currentDatabase}...`);
+           
+           const requestData = {
+               database: currentDatabase,
+               analysis_prompt: prompt,
+               processing_mode: document.getElementById('processing-mode').value,
+               provider: document.getElementById('provider-select').value,
+               api_key: document.getElementById('api-key-select').value
+           };
+           
+           try {
+               const response = await fetch('/api/batch_process', {
+                   method: 'POST',
+                   headers: {'Content-Type': 'application/json'},
+                   body: JSON.stringify(requestData)
+               });
+               
+               if (!response.ok) {
+                   const errorData = await response.json();
+                   throw new Error(errorData.detail || 'Server error');
+               }
+               
+               const data = await response.json();
+               addMessage('assistant', data.result);
+               
+           } catch (error) {
+               addMessage('system', `❌ Batch process error: ${error.message}`);
+           }
+       }
+       
+       async function startLegalAnalysis() {
+           if (!currentDatabase || selectedFiles.length === 0) return;
+           
+           addMessage('system', '⚖️ Starting legal analysis on selected documents...');
+           
+           const message = 'Perform comprehensive legal analysis focusing on procedural issues, service defects, and statutory violations.';
+           
+           const requestData = {
+               database: currentDatabase,
+               files: selectedFiles,
+               message: message,
+               provider: document.getElementById('provider-select').value,
+               api_key: document.getElementById('api-key-select').value,
+               context_mode: 'fresh',
+               master_contexts: ['service_defects', 'tpa_violations', 'court_procedure']
+           };
+           
+           try {
+               const response = await fetch('/api/chat', {
+                   method: 'POST',
+                   headers: {'Content-Type': 'application/json'},
+                   body: JSON.stringify(requestData)
+               });
+               
+               if (!response.ok) {
+                   const errorData = await response.json();
+                   throw new Error(errorData.detail || 'Server error');
+               }
+               
+               const data = await response.json();
+               addMessage('assistant', data.response);
+               
+           } catch (error) {
+               addMessage('system', `❌ Legal analysis error: ${error.message}`);
+           }
+       }
+       
+       function addMessage(role, content) {
+           const chatMessages = document.getElementById('chat-messages');
+           const messageDiv = document.createElement('div');
+           messageDiv.className = `message ${role}`;
+           
+           const roleSpan = document.createElement('div');
+           roleSpan.className = 'message-role';
+           roleSpan.textContent = role.toUpperCase();
+           
+           const contentDiv = document.createElement('div');
+           contentDiv.className = 'message-content';
+           contentDiv.textContent = content;
+           
+           messageDiv.appendChild(roleSpan);
+           messageDiv.appendChild(contentDiv);
+           
+           // Add save button for assistant responses
+           if (role === 'assistant' && !content.startsWith('❌')) {
+               const saveBtn = document.createElement('button');
+               saveBtn.textContent = '💾 Save Analysis';
+               saveBtn.className = 'btn';
+               saveBtn.style.marginTop = '10px';
+               saveBtn.onclick = () => saveAnalysis(content);
+               messageDiv.appendChild(saveBtn);
+           }
+           
+           chatMessages.appendChild(messageDiv);
+           chatMessages.scrollTop = chatMessages.scrollHeight;
+       }
+       
+       async function saveAnalysis(content) {
+           const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+           const filename = `legal_analysis_${timestamp}.md`;
+           
+           try {
+               const response = await fetch('/api/save_analysis', {
+                   method: 'POST',
+                   headers: {'Content-Type': 'application/json'},
+                   body: JSON.stringify({
+                       filename: filename,
+                       content: content,
+                       database: currentDatabase,
+                       files: selectedFiles
+                   })
+               });
+               
+               const data = await response.json();
+               if (data.success) {
+                   addMessage('system', `✅ Analysis saved: ${filename}`);
+               }
+               
+           } catch (error) {
+               addMessage('system', `❌ Save error: ${error.message}`);
+           }
+       }
+   </script>
 </body>
 </html>""")
 
-@app.get("/api/view_file", response_class=HTMLResponse)
-async def view_file_content(file_id: str = Query(...), database: str = Query(...)):
-    """View file content in popup window"""
-    try:
-        # Get database client
-        if database == "remember_db":
-            client = get_client()
-        else:
-            db_path = Path.home() / database
-            client = chromadb.PersistentClient(path=str(db_path))
-        
-        # Find the file
-        collections = client.list_collections()
-        file_content = None
-        file_metadata = {}
-        
-        for collection in collections:
-            collection_data = client.get_collection(collection.name)
-            try:
-                result = collection_data.get(
-                    ids=[file_id], 
-                    include=["documents", "metadatas"]
-                )
-                if result["documents"]:
-                    file_content = result["documents"][0]
-                    file_metadata = result["metadatas"][0] if result["metadatas"] else {}
-                    break
-            except:
-                continue
-        
-        if not file_content:
-            raise HTTPException(status_code=404, detail="File not found")
-        
-        # Return formatted HTML viewer
-        html_content = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>File Viewer - {file_metadata.get('title', file_id)}</title>
-    <style>
-        body {{ 
-            font-family: 'Courier New', monospace; 
-            background: #0a0a0a; color: #00ff00; 
-            padding: 20px; line-height: 1.6; 
-        }}
-        
-        .header {{ 
-            background: #1a1a1a; padding: 15px; 
-            border: 1px solid #333; border-radius: 4px; 
-            margin-bottom: 20px; 
-        }}
-        
-        .file-title {{ 
-            color: #00ff00; font-size: 18px; 
-            font-weight: bold; margin-bottom: 10px; 
-        }}
-        
-        .file-meta {{ 
-            color: #888; font-size: 12px; 
-            display: grid; grid-template-columns: 1fr 1fr; gap: 10px; 
-        }}
-        
-        .content {{ 
-            background: #111; padding: 20px; 
-            border: 1px solid #333; border-radius: 4px; 
-            white-space: pre-wrap; word-wrap: break-word; 
-            max-height: 70vh; overflow-y: auto; 
-        }}
-        
-        .actions {{ 
-            position: fixed; top: 10px; right: 10px; 
-            display: flex; gap: 10px; 
-        }}
-        
-        .btn {{ 
-            background: #333; border: 1px solid #555; 
-            color: #ccc; padding: 8px 12px; 
-            border-radius: 3px; cursor: pointer; 
-            font-size: 11px; 
-        }}
-        
-        .btn:hover {{ background: #444; }}
-        .btn.primary {{ background: #0066cc; color: white; }}
-    </style>
-</head>
-<body>
-    <div class="actions">
-        <button class="btn" onclick="window.print()">🖨️ Print</button>
-        <button class="btn primary" onclick="copyToClipboard()">📋 Copy</button>
-        <button class="btn" onclick="window.close()">❌ Close</button>
-    </div>
-    
-    <div class="header">
-        <div class="file-title">{file_metadata.get('title', file_id)}</div>
-        <div class="file-meta">
-            <div><strong>ID:</strong> {file_id}</div>
-            <div><strong>Database:</strong> {database}</div>
-            <div><strong>Type:</strong> {file_metadata.get('type', 'Unknown')}</div>
-            <div><strong>Size:</strong> {len(file_content):,} characters</div>
-            <div><strong>Created:</strong> {file_metadata.get('created', 'Unknown')}</div>
-            <div><strong>Rating:</strong> {file_metadata.get('rating', 'N/A')}/5</div>
-        </div>
-    </div>
-    
-    <div class="content" id="file-content">{file_content}</div>
-    
-    <script>
-        function copyToClipboard() {{
-            const content = document.getElementById('file-content').textContent;
-            navigator.clipboard.writeText(content).then(() => {{
-                alert('Content copied to clipboard!');
-            }}).catch(err => {{
-                console.error('Failed to copy: ', err);
-                // Fallback for older browsers
-                const textArea = document.createElement('textarea');
-                textArea.value = content;
-                document.body.appendChild(textArea);
-                textArea.select();
-                document.execCommand('copy');
-                document.body.removeChild(textArea);
-                alert('Content copied to clipboard!');
-            }});
-        }}
-        
-        // Auto-focus for easier reading
-        window.addEventListener('load', () => {{
-            document.getElementById('file-content').focus();
-        }});
-    </script>
-</body>
-</html>"""
-        
-        return HTMLResponse(content=html_content)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"File viewer error: {e}")
+# EXTRACTION BACKEND ENDPOINTS
 
-@app.get("/api/databases")
-async def get_databases():
-    """Get all available ChromaDB databases"""
-    try:
-        # Scan for available databases
-        databases = []
-        
-        # Default remember database
-        try:
-            client = get_client()
-            collections = client.list_collections()
-            
-            total_docs = 0
-            for collection in collections:
-                collection_data = client.get_collection(collection.name)
-                count = collection_data.count()
-                total_docs += count
-            
-            databases.append({
-                "name": "remember_db",
-                "path": str(Path.home() / "remember_db"),
-                "collections": len(collections),
-                "documents": total_docs,
-                "type": "primary"
-            })
-        except Exception as e:
-            print(f"⚠️ Could not access remember_db: {e}")
-        
-        # Scan for other databases in common locations
-        common_paths = [
-            Path.home() / "peacock_db",
-            Path.home() / "legal_research_db", 
-            Path.home() / "eviction_defense_db"
-        ]
-        
-        for db_path in common_paths:
-            if db_path.exists():
-                try:
-                    client = chromadb.PersistentClient(path=str(db_path))
-                    collections = client.list_collections()
-                    
-                    total_docs = 0
-                    for collection in collections:
-                        collection_data = client.get_collection(collection.name)
-                        count = collection_data.count()
-                        total_docs += count
-                    
-                    databases.append({
-                        "name": db_path.name,
-                        "path": str(db_path),
-                        "collections": len(collections),
-                        "documents": total_docs,
-                        "type": "secondary"
-                    })
-                except Exception as e:
-                    print(f"⚠️ Could not access {db_path}: {e}")
-        
-        return {"databases": databases}
-        
-    except Exception as e:
-        return {"databases": [], "error": str(e)}
+PROXY_ORDER = [
+   ("Local", None),
+   ("Mobile", "http://52fb2fcd77ccbf54b65c:5a02792bf800a049@gw.dataimpulse.com:823"),
+   ("Residential", "http://0aa180faa467ad67809b__cr.us:6dc612d4a08ca89d@gw.dataimpulse.com:823")
+]
 
-@app.get("/api/database/{database_name}/files")
-async def get_database_files(database_name: str):
-    """Get files from specific database"""
-    try:
-        if database_name == "remember_db":
-            client = get_client()
-        else:
-            db_path = Path.home() / database_name
-            client = chromadb.PersistentClient(path=str(db_path))
-        
-        collections = client.list_collections()
-        files = []
-        
-        for collection in collections:
-            collection_data = client.get_collection(collection.name)
-            data = collection_data.get(include=["metadatas"])
-            
-            if data["ids"]:
-                for i, doc_id in enumerate(data["ids"]):
-                    metadata = data["metadatas"][i] if data["metadatas"] else {}
-                    
-                    files.append({
-                        "id": doc_id,
-                        "collection": collection.name,
-                        "title": metadata.get("title", doc_id),
-                        "type": metadata.get("type", "document"),
-                        "size": len(str(metadata)),
-                        "created": metadata.get("created", "unknown"),
-                        "rating": metadata.get("rating", 0)
-                    })
-        
-        return {"files": files}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+USER_AGENTS = [
+   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
+]
 
-@app.post("/api/chat")
-async def chat_with_files(request: ChatRequest):
-    """Process chat request through Remember system"""
-    try:
-        # Get database client
-        if request.database == "remember_db":
-            client = get_client()
-        else:
-            db_path = Path.home() / request.database
-            client = chromadb.PersistentClient(path=str(db_path))
-        
-        # Get selected documents
-        documents = []
-        for file_id in request.files:
-            # Find which collection contains this file
-            collections = client.list_collections()
-            for collection in collections:
-                collection_data = client.get_collection(collection.name)
-                try:
-                    result = collection_data.get(
-                        ids=[file_id], 
-                        include=["documents", "metadatas"]
-                    )
-                    if result["documents"]:
-                        documents.append({
-                            "content": result["documents"][0],
-                            "metadata": result["metadatas"][0] if result["metadatas"] else {}
-                        })
-                        break
-                except:
-                    continue
-        
-        if not documents:
-            raise HTTPException(status_code=404, detail="No documents found")
-        
-        # Combine documents
-        combined_content = "\n\n---DOCUMENT SEPARATOR---\n\n".join([
-            f"Document: {doc['metadata'].get('title', 'Unknown')}\n{doc['content']}"
-            for doc in documents
-        ])
-        
-        # Add master contexts if selected
-        context_prompts = {
-            'service_defects': """You are a California legal expert specializing in service of process defects under CCP 415.20.
-Focus on: substitute service requirements, proof of service fraud, certified mail completion, personal vs substitute service analysis.""",
-            
-            'tpa_violations': """You are a California tenant rights expert specializing in Tenant Protection Act violations.
-Focus on: Civil Code 1946.2 requirements, just cause eviction protections, 10+ year occupancy rights, fraudulent exemption claims.""",
-            
-            'court_procedure': """You are a court procedure expert specializing in California civil litigation.
-Focus on: motion practice, evidence rules, procedural deadlines, jurisdiction issues, due process requirements.""",
-            
-            'case_timeline': """You are a legal timeline expert tracking case progression and deadlines.
-Focus on: statute of limitations, procedural deadlines, notice requirements, hearing schedules, appeal timelines."""
-        }
-        
-        master_context = ""
-        for context_type in request.master_contexts:
-            if context_type in context_prompts:
-                master_context += f"\n{context_prompts[context_type]}\n"
-        
-        # Build analysis prompt
-        analysis_prompt = f"""
-{master_context}
+@app.post("/api/start_extraction")
+async def start_extraction(background_tasks: BackgroundTasks):
+   """Start URL extraction process"""
+   global extraction_progress
+   
+   if extraction_progress["active"]:
+       return {"success": False, "error": "Extraction already in progress"}
+   
+   # Load URLs from urls.txt
+   urls_file = Path.home() / "remember" / "urls.txt"
+   if not urls_file.exists():
+       return {"success": False, "error": "urls.txt not found"}
+   
+   try:
+       with open(urls_file, 'r') as f:
+           urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+       
+       if not urls:
+           return {"success": False, "error": "No URLs found in urls.txt"}
+       
+       # Reset progress
+       extraction_progress.update({
+           "active": True,
+           "total_urls": len(urls),
+           "current_index": 0,
+           "current_url": "",
+           "success_count": 0,
+           "failed_count": 0,
+           "total_chars": 0,
+           "start_time": datetime.now(),
+           "status": "processing",
+           "results": []
+       })
+       
+       # Start extraction in background
+       background_tasks.add_task(run_extraction, urls)
+       
+       return {"success": True, "total_urls": len(urls)}
+       
+   except Exception as e:
+       return {"success": False, "error": str(e)}
 
-LEGAL ANALYSIS REQUEST:
-{request.message}
+@app.get("/api/extraction_progress")
+async def get_extraction_progress():
+   """Get current extraction progress"""
+   global extraction_progress
+   
+   progress_data = extraction_progress.copy()
+   if progress_data["start_time"]:
+       progress_data["start_time"] = progress_data["start_time"].isoformat()
+   
+   return progress_data
 
-DOCUMENTS TO ANALYZE:
-{combined_content}
+@app.post("/api/cancel_extraction")
+async def cancel_extraction():
+   """Cancel extraction process"""
+   global extraction_progress
+   extraction_progress["active"] = False
+   extraction_progress["status"] = "cancelled"
+   return {"success": True}
 
-Provide detailed legal analysis addressing the user's request with specific attention to any master contexts selected.
-"""
-        
-        # Process through Groq client
-        success, response, debug = groq_client.simple_chat(
-            message=analysis_prompt,
-            system_prompt="You are an expert legal analyst. Provide thorough, accurate analysis."
-        )
-        
-        if success:
-            return {
-                "response": response,
-                "debug_info": debug,
-                "documents_processed": len(documents),
-                "database": request.database
-            }
-        else:
-            raise HTTPException(status_code=500, detail=f"Analysis failed: {debug}")
-            
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Chat processing error: {e}")
+async def run_extraction(urls: List[str]):
+   """Run the actual extraction process"""
+   global extraction_progress
+   
+   remember_dir = Path.home() / "remember"
+   content_dir = remember_dir / "scraped_content"
+   content_dir.mkdir(exist_ok=True, parents=True)
+   
+   all_results = []
+   
+   for i, url in enumerate(urls):
+       if not extraction_progress["active"]:
+           break
+       
+       extraction_progress["current_index"] = i + 1
+       extraction_progress["current_url"] = url
+       
+       success = False
+       
+       for attempt, (proxy_name, proxy_url) in enumerate(PROXY_ORDER):
+           try:
+               session = requests.Session()
+               session.headers.update({'User-Agent': random.choice(USER_AGENTS)})
+               if proxy_url:
+                   session.proxies = {"http": proxy_url, "https": proxy_url}
+               
+               response = session.get(url, timeout=30, stream=True)
+               response.raise_for_status()
+               
+               content_type = response.headers.get('Content-Type', '').lower()
+               
+               if 'application/pdf' in content_type:
+                   # Handle PDF
+                   pdf_bytes = response.content
+                   doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+                   pdf_text = "".join(page.get_text() for page in doc)
+                   doc.close()
+                   
+                   title = f"[PDF] {Path(url).name}"
+                   best_content = pdf_text
+               else:
+                   # Handle HTML
+                   clean_content = response.text.replace('\x00', '')
+                   doc = Document(clean_content)
+                   title = doc.title()
+                   best_content = BeautifulSoup(doc.summary(), 'html.parser').get_text(separator='\n', strip=True)
+                   
+                   if not best_content or len(best_content) < 100:
+                       soup = BeautifulSoup(clean_content, 'html.parser')
+                       for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form"]):
+                           tag.decompose()
+                       best_content = soup.get_text(separator='\n', strip=True)
+               
+               # Create markdown file
+               md_filename = clean_filename(url, "md")
+               md_filepath = content_dir / md_filename
+               
+               with open(md_filepath, 'w', encoding='utf-8') as f:
+                   f.write(f"# {title}\n\n_Source: {url}_\n\n---\n\n{best_content}")
+               
+               rating = calculate_rating(len(best_content))
+               
+               result = {
+                   "url": url,
+                   "title": title,
+                   "rating": rating,
+                   "markdown_file": str(md_filepath),
+                   "content": best_content
+               }
+               
+               all_results.append(result)
+               extraction_progress["success_count"] += 1
+               extraction_progress["total_chars"] += len(best_content)
+               
+               success = True
+               break
+               
+           except Exception as e:
+               continue
+       
+       if not success:
+           extraction_progress["failed_count"] += 1
+   
+   # Save results JSON
+   if all_results:
+       timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+       results_file = remember_dir / f'extraction_results_{timestamp}.json'
+       
+       with open(results_file, 'w', encoding='utf-8') as f:
+           json.dump(all_results, f, indent=2)
+       
+       # Auto-import to database
+       try:
+           import_result = import_extraction_session(str(results_file))
+           extraction_progress["import_result"] = import_result
+       except Exception as e:
+           extraction_progress["import_error"] = str(e)
+   
+   extraction_progress["active"] = False
+   extraction_progress["status"] = "completed"
 
-@app.post("/api/batch_process")
-async def batch_process_documents(request: BatchProcessRequest):
-    """Batch process all documents in database - FIXED VERSION"""
-    try:
-        print(f"🚀 Starting batch processing: {request.database}")
-        
-        # Get database client
-        if request.database == "remember_db":
-            client = get_client()
-        else:
-            db_path = Path.home() / request.database
-            if not db_path.exists():
-                raise HTTPException(status_code=404, detail=f"Database not found: {request.database}")
-            client = chromadb.PersistentClient(path=str(db_path))
-        
-        # Get all documents
-        collections = client.list_collections()
-        all_documents = []
-        
-        print(f"📊 Found {len(collections)} collections")
-        
-        for collection in collections:
-            collection_data = client.get_collection(collection.name)
-            data = collection_data.get(include=["documents", "metadatas"])
-            
-            if data["documents"]:
-                print(f"📁 Collection '{collection.name}': {len(data['documents'])} documents")
-                for i, doc in enumerate(data["documents"]):
-                    metadata = data["metadatas"][i] if data["metadatas"] else {}
-                    all_documents.append({
-                        "content": doc[:5000],  # Limit content to prevent token overflow
-                        "metadata": metadata,
-                        "collection": collection.name,
-                        "id": data["ids"][i]
-                    })
-        
-        if not all_documents:
-            return {"result": "❌ No documents found in database"}
-        
-        print(f"📋 Total documents to process: {len(all_documents)}")
-        
-        # Process based on mode
-        if request.processing_mode == "individual":
-            # Process each document individually with progress
-            results = []
-            
-            for i, doc in enumerate(all_documents):
-                doc_title = doc['metadata'].get('title', doc['id'])
-                print(f"📄 Processing {i+1}/{len(all_documents)}: {doc_title}")
-                
-                prompt = f"""ANALYSIS PROMPT: {request.analysis_prompt}
+def clean_filename(url: str, extension: str) -> str:
+   """Clean URL for filename"""
+   clean = re.sub(r'^https?:\/\/', '', url).replace('/', '_')
+   clean = re.sub(r'[\\?%*:|"<>]', '', clean)
+   return f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{clean[:70]}.{extension}"
 
-DOCUMENT TITLE: {doc_title}
-DOCUMENT CONTENT:
-{doc['content']}
-
-Provide focused analysis based on the prompt above."""
-                
-                try:
-                    success, response, debug = groq_client.simple_chat(
-                        message=prompt,
-                        system_prompt="You are an expert legal analyst. Provide concise, focused analysis."
-                    )
-                    
-                    if success:
-                        # Truncate response for batch view
-                        truncated_response = response[:800] + "..." if len(response) > 800 else response
-                        results.append({
-                            "document": doc_title,
-                            "analysis": truncated_response,
-                            "status": "✅ Success"
-                        })
-                    else:
-                        results.append({
-                            "document": doc_title,
-                            "analysis": f"❌ Analysis failed: {debug}",
-                            "status": "❌ Failed"
-                        })
-                        
-                except Exception as e:
-                    results.append({
-                        "document": doc_title,
-                        "analysis": f"❌ Error: {str(e)}",
-                        "status": "❌ Error"
-                    })
-            
-            # Format results
-            successful = len([r for r in results if r["status"] == "✅ Success"])
-            result_text = f"""📊 BATCH PROCESSING COMPLETE
-
-📋 Documents Processed: {len(results)}
-✅ Successful: {successful}
-❌ Failed: {len(results) - successful}
-
-📄 INDIVIDUAL ANALYSIS RESULTS:
-
-"""
-            
-            for i, result in enumerate(results, 1):
-                result_text += f"""#{i} {result['status']} {result['document']}
-{result['analysis']}
-
-{'='*80}
-
-"""
-            
-            return {"result": result_text}
-            
-        elif request.processing_mode == "batch":
-            # Combine documents for single analysis
-            print("🔄 Processing in batch mode...")
-            
-            # Create summary of all documents
-            doc_summaries = []
-            for doc in all_documents[:50]:  # Limit to 50 docs to prevent token overflow
-                doc_title = doc['metadata'].get('title', doc['id'])
-                doc_preview = doc['content'][:1000]  # First 1000 chars
-                doc_summaries.append(f"Document: {doc_title}\nPreview: {doc_preview}\n")
-            
-            combined_summary = "\n---DOCUMENT SEPARATOR---\n".join(doc_summaries)
-            
-            prompt = f"""BATCH ANALYSIS REQUEST: {request.analysis_prompt}
-
-DOCUMENTS TO ANALYZE ({len(all_documents)} total documents):
-{combined_summary}
-
-Provide comprehensive batch analysis addressing the prompt for all documents."""
-            
-            try:
-                success, response, debug = groq_client.simple_chat(
-                    message=prompt,
-                    system_prompt="You are an expert legal analyst. Provide comprehensive batch analysis."
-                )
-                
-                if success:
-                    result_text = f"""📊 BATCH ANALYSIS COMPLETE
-
-📋 Documents Analyzed: {len(all_documents)}
-🔄 Processing Mode: Batch Summary
-
-📄 COMPREHENSIVE ANALYSIS:
-
-{response}
-
-{'='*80}
-
-💡 This analysis covers {len(all_documents)} documents from the {request.database} database.
-"""
-                    return {"result": result_text}
-                else:
-                    return {"result": f"❌ Batch analysis failed: {debug}"}
-                    
-            except Exception as e:
-                return {"result": f"❌ Batch processing error: {str(e)}"}
-                
-        else:  # progressive mode
-            print("🔄 Processing in progressive mode...")
-            
-            progressive_context = ""
-            result_text = f"""📊 PROGRESSIVE ANALYSIS
-
-📋 Documents: {len(all_documents)}
-🔄 Mode: Progressive Context Building
-
-📄 PROGRESSIVE RESULTS:
-
-"""
-            
-            for i, doc in enumerate(all_documents[:20]):  # Limit to 20 for progressive
-                doc_title = doc['metadata'].get('title', doc['id'])
-                print(f"📄 Progressive analysis {i+1}/20: {doc_title}")
-                
-                context_prompt = f"""ANALYSIS PROMPT: {request.analysis_prompt}
-
-PREVIOUS ANALYSIS CONTEXT:
-{progressive_context[-2000:]}  
-
-NEW DOCUMENT TO ANALYZE:
-Title: {doc_title}
-Content: {doc['content'][:1500]}
-
-Analyze this document in context of previous analysis."""
-                
-                try:
-                    success, response, debug = groq_client.simple_chat(
-                        message=context_prompt,
-                        system_prompt="Analyze this document in context of previous analysis. Build cumulative understanding."
-                    )
-                    
-                    if success:
-                        progressive_context += f"\n\nDocument {i+1} Analysis: {response}"
-                        
-                        # Add to results (truncated for display)
-                        truncated_response = response[:500] + "..." if len(response) > 500 else response
-                        result_text += f"""#{i+1} ✅ {doc_title}
-{truncated_response}
-
-"""
-                    else:
-                        result_text += f"#{i+1} ❌ {doc_title}\nAnalysis failed: {debug}\n\n"
-                        
-                except Exception as e:
-                    result_text += f"#{i+1} ❌ {doc_title}\nError: {str(e)}\n\n"
-            
-            result_text += f"""
-{'='*80}
-
-💡 Progressive analysis built cumulative understanding across {min(20, len(all_documents))} documents.
-"""
-            
-            return {"result": result_text}
-            
-    except Exception as e:
-        print(f"❌ Batch processing error: {e}")
-        raise HTTPException(status_code=500, detail=f"Batch processing error: {e}")
-
-@app.post("/api/save_analysis")
-async def save_analysis(request: dict):
-    """Save analysis results to file"""
-    try:
-        # Create results directory
-        results_dir = Path.home() / "remember" / "legal_results"
-        results_dir.mkdir(exist_ok=True)
-        
-        # Save analysis
-        file_path = results_dir / request["filename"]
-        
-        analysis_content = f"""# Legal Analysis Results
-Generated: {datetime.now().isoformat()}
-Database: {request['database']}
-Files Analyzed: {len(request['files'])}
-
-## Analysis
-
-{request['content']}
-
-## Metadata
-- Database: {request['database']}
-- Files: {', '.join(request['files'])}
-- Generated by: Remember Legal AI System
-"""
-        
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write(analysis_content)
-        
-        return {"success": True, "path": str(file_path)}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Save error: {e}")
-
-if __name__ == "__main__":
-    print("\n🔗 Remember Legal AI War Room Starting...")
-    print(f"📊 Groq Keys: {len(groq_client.router.api_manager.api_keys)}")
-    print(f"🎯 System Ready: http://localhost:8080")
-    print("="*50)
-    
-    uvicorn.run(app, host="0.0.0.0", port=8080)
+def calculate_rating(length: int) -> int:
+   """Calculate content rating"""
+   if length > 8000: return 5
+   if length > 4000: return 4
+   if length > 1500: return 3
+   if length > 500: return 2
+   return 1
