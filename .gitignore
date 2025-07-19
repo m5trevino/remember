@@ -10,3 +10,4 @@ __pycache__/
 *.log
 remember_db/
 legal_results/
+projects.json
