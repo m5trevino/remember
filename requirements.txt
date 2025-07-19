@@ -1,0 +1,13 @@
+beautifulsoup4
+chromadb
+fastapi
+html2text
+pydantic
+python-dotenv
+questionary
+readability-lxml
+requests
+rich
+tiktoken
+uvicorn[standard]
+PyMuPDF

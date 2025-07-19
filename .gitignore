@@ -1,0 +1,87 @@
+# Block ALL potentially sensitive files
+.env*
+*.env
+*key*
+*secret*
+*token*
+
+# Block ALL JSON files (they might contain API keys)
+*.json
+
+# Block extraction results and data
+extraction_*
+*results*
+urls*
+conversations*
+users*
+projects*
+
+# Block Python cache
+__pycache__/
+*.pyc
+
+# Block logs and temp
+*.log
+*.tmp
+*temp*
+*(copy)*
+# API Keys and sensitive files
+.env*
+*.env
+*key*
+*secret*
+*token*
+*api*
+
+# Conversation logs and merged content
+wholeconvo.txt
+merged_content.txt
+merge/
+conversations.json
+
+# Extraction results with potential sensitive data
+extraction_results_*
+urls.txt
+
+# Python cache and logs
+__pycache__/
+*.pyc
+*.log
+*.tmp
+
+# Database files
+*.db
+*.sqlite*
+chroma*/
+remember_db/
+peacock_db/
+# API Keys and sensitive files
+.env*
+*.env
+*key*
+*secret*
+*token*
+*api*
+
+# Conversation logs and merged content
+wholeconvo.txt
+merged_content.txt
+merge/
+conversations.json
+
+# Extraction results with potential sensitive data
+extraction_results_*
+urls.txt
+
+# Python cache and logs
+__pycache__/
+*.pyc
+*.log
+*.tmp
+
+# Database files
+*.db
+*.sqlite*
+chroma*/
+remember_db/
+peacock_db/
