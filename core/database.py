@@ -18,14 +18,13 @@ def get_or_create_collection(name: str, metadata: Optional[Dict] = None):
     client = get_client()
     try:
         return client.get_collection(name)
-    except ValueError:
+    except Exception:
         return client.create_collection(
             name=name,
             metadata=metadata or {"created": datetime.now().isoformat()}
         )
-
 def import_extraction_session(json_file_path: str) -> Dict[str, Any]:
-    """Import JSON extraction results, using the full content for the DB record."""
+    """Import JSON extraction results with structured vector IDs like doc_001, doc_002, etc."""
     with open(json_file_path, 'r', encoding='utf-8') as f:
         extraction_data = json.load(f)
     
@@ -34,35 +33,85 @@ def import_extraction_session(json_file_path: str) -> Dict[str, Any]:
     collection = get_or_create_collection(collection_name)
     
     documents, metadatas, ids = [], [], []
+    doc_counter = 1
     
     for result in extraction_data:
         full_content = result.get('content', '')
         if not full_content:
             continue
 
-        doc_id = f"url_{hashlib.md5(result.get('url', '').encode()).hexdigest()}"
+        # Create structured vector ID: doc_001, doc_002, etc.
+        doc_id = f"doc_{doc_counter:03d}"
         
         metadata = {
-            "url": result.get('url', ''),
-            "title": result.get('title', 'No Title'),
-            "rating": result.get('rating', 0),
-            "markdown_file": result.get('markdown_file', ''),
-            "session": session_id,
+            "url": str(result.get('url', '')),
+            "title": str(result.get('title', 'No Title')),
+            "rating": int(result.get('rating', 0)) if result.get('rating') is not None else 0,
+            "markdown_file": str(result.get('markdown_file', '')),
+            "session": str(session_id),
             "created": datetime.now().isoformat(),
+            "vector_id": doc_id  # Store the vector ID in metadata for reference
         }
         
         documents.append(full_content)
         metadatas.append(metadata)
         ids.append(doc_id)
+        doc_counter += 1
     
     if documents:
         collection.add(documents=documents, metadatas=metadatas, ids=ids)
+        
+        # Update markdown files with vector ID headers
+        update_markdown_files_with_vector_ids(extraction_data, session_id)
     
     return {
         "session_id": session_id,
         "urls_imported": len(documents),
-        "collection_name": collection_name
+        "collection_name": collection_name,
+        "vector_ids_created": [f"doc_{i+1:03d}" for i in range(len(documents))]
     }
+
+def update_markdown_files_with_vector_ids(extraction_data: List[Dict], session_id: str):
+    """Add vector ID headers to markdown files"""
+    doc_counter = 1
+    
+    for result in extraction_data:
+        markdown_file = result.get('markdown_file', '')
+        if not markdown_file or not Path(markdown_file).exists():
+            continue
+            
+        vector_id = f"doc_{doc_counter:03d}"
+        
+        try:
+            # Read current markdown content
+            with open(markdown_file, 'r', encoding='utf-8') as f:
+                current_content = f.read()
+            
+            # Check if vector ID header already exists
+            if f"Vector ID: {vector_id}" not in current_content:
+                # Add vector ID header at the top
+                header = f"""---
+Vector ID: {vector_id}
+Title: {result.get('title', 'Unknown')}
+URL: {result.get('url', '')}
+Rating: {result.get('rating', 0)}⭐
+Session: {session_id}
+Imported: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+---
+
+"""
+                
+                # Write updated content
+                with open(markdown_file, 'w', encoding='utf-8') as f:
+                    f.write(header + current_content)
+                    
+                print(f"✅ Updated {markdown_file} with vector ID: {vector_id}")
+            
+            doc_counter += 1
+            
+        except Exception as e:
+            print(f"❌ Failed to update {markdown_file}: {e}")
+            continue
 
 def search_extractions(query: str, limit: int = 20) -> List[Dict[str, Any]]:
     """Search across all extraction sessions in remember_db."""

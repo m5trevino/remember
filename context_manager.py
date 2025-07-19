@@ -28,13 +28,18 @@ class ContextManager:
     """Manages context size, chunking, and token limits"""
     
     def __init__(self):
-        # Model token limits (conservative estimates)
+        # Model token limits (based on actual Groq capabilities)
         self.model_limits = {
-            "llama-3.3-70b-versatile": 8000,
-            "llama-3.1-70b-versatile": 8000,
-            "llama-3.1-8b-instant": 8000,
-            "llama3-groq-70b-8192-tool-use-preview": 8000,
-            "llama3-groq-8b-8192-tool-use-preview": 8000
+            "deepseek-r1-distill-llama-70b": 120000,  # 131K context - reserve for completion
+            "llama-3.3-70b-versatile": 120000,        # 131K context - reserve for completion  
+            "llama-3.1-70b-versatile": 120000,        # 131K context - reserve for completion
+            "llama-3.1-8b-instant": 120000,           # 131K context - reserve for completion
+            "meta-llama/llama-4-scout-17b-16e-instruct": 120000,    # 131K context
+            "meta-llama/llama-4-maverick-17b-128e-instruct": 120000, # 131K context
+            "moonshotai/kimi-k2-instruct": 120000,     # 131K context
+            "gemma2-9b-it": 7000,                      # 8K context - smaller model
+            "llama3-groq-70b-8192-tool-use-preview": 7000,
+            "llama3-groq-8b-8192-tool-use-preview": 7000
         }
         
         # Reserve tokens for response

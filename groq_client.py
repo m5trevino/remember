@@ -21,8 +21,8 @@ class GroqClient:
         self.context_manager = ContextManager()
         
         # Client settings
-        self.default_model = "llama-3.3-70b-versatile"
-        self.default_max_tokens = 4000
+        self.default_model = "deepseek-r1-distill-llama-70b"
+        self.default_max_tokens = 131072  # DeepSeek's actual max completion tokens
         self.default_temperature = 0.1
         
         # Automation settings
