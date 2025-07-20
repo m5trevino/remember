@@ -1,4 +1,5 @@
-  File "/home/flintx/remember/remember_web_ui.py", line 216
-    return {"success": False, "error": "Missing document_id parameter"}
-    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-SyntaxError: 'return' with value in async generator
+WARNING:  Current configuration will not reload as not all conditions are met, please refer to documentation.
+INFO:     Started server process [52499]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8080 (Press CTRL+C to quit)

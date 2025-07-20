@@ -1,37 +1,21 @@
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-
-# Environment & Secrets - VERY IMPORTANT
-.env
+# Secrets - DO NOT COMMIT
 api_key_manager.py
+.env
 
-# Generated Data & Logs
+# Generated data, logs, and other large directories
+batch_results/
+extractions/
 llm_logs/
 llm_responses/
-scraped_content/
-pdfs/
 notes/
-master_contexts/
-
-# Backups and Temporary Files
-*.backup
-*.backup*
-*-backup.py
-*-backup1.py
-*(copy).py
-temp_*.js
-
-# OS-specific
-.DS_Store
-
-# Other specific files you wanted to ignore
+pdfs/
+scraped_content/
 Untitled Folder/
-webui.py
-Screenshot_*.png
-LEGAL_AI_USAGE.md
-legal_ai_directive.md
-"Introduction to Tool Use - GroqDocs(2).md"
+server.log
+
+# Python cache files
+__pycache__/
+*.pyc
+
+# A file you previously wanted to ignore
 "cfonts 'LEGAL|WAR ROOM' -f pallet -g yellow,re.py"
