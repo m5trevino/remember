@@ -9,7 +9,7 @@ import os
 import asyncio
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
@@ -31,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).parent.absolute()))
 
 try:
     from groq_client import GroqClient
-    from core.database import get_client, import_extraction_session
+    from core.database import get_client, import_extraction_session, get_or_create_collection
     from commands.legal_handler import LegalHandler
     from mcp_server import get_mcp_tools, execute_mcp_tool
 except ImportError as e:
@@ -66,8 +66,9 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def log_llm_interaction(interaction_type: str, data: Any, session_id: str = None):
-    """Log LLM interactions to file with timestamp"""
-    timestamp = datetime.now().isoformat()
+    """Log LLM interactions to separate files per call"""
+    now = datetime.now()
+    timestamp = now.isoformat()
     session_id = session_id or f"session_{timestamp.replace(':', '').replace('-', '').replace('.', '')}"
     
     log_entry = {
@@ -77,12 +78,20 @@ def log_llm_interaction(interaction_type: str, data: Any, session_id: str = None
         "data": data
     }
     
-    # Log to file
-    log_file = logs_dir / f"raw_llm_data_{datetime.now().strftime('%Y%m%d')}.json"
-    with open(log_file, 'a', encoding='utf-8') as f:
-        f.write(json.dumps(log_entry, indent=2) + "\n" + "="*50 + "\n")
+    # Create separate file per call: week-day-hour-minute-llmcall.json
+    week_of_year = now.isocalendar()[1]
+    day_of_month = now.day
+    hour = now.hour
+    minute = now.minute
     
-    logger.info(f"[{interaction_type}] Session: {session_id[:8]}... - Data logged")
+    log_filename = f"{week_of_year:02d}-{day_of_month:02d}-{hour:02d}{minute:02d}-llmcall.json"
+    log_file = logs_dir / log_filename
+    
+    # Write to separate file (not append)
+    with open(log_file, 'w', encoding='utf-8') as f:
+        f.write(json.dumps(log_entry, indent=2))
+    
+    logger.info(f"[{interaction_type}] Session: {session_id[:8]}... - Data logged to {log_filename}")
     return session_id
 
 # Global progress tracking
@@ -112,24 +121,46 @@ class ChatRequest(BaseModel):
 
 class BatchProcessRequest(BaseModel):
     database: str
+    selected_files: List[str]
+    master_context: str
     analysis_prompt: str
     processing_mode: str
     provider: str
     api_key: str = "auto"
 
-@app.post("/api/batch_process")
-async def batch_process_handler(request: BatchProcessRequest):
-    """Handle batch processing with auto-save functionality"""
+async def batch_process_generator(request: BatchProcessRequest):
+    """Generator for streaming batch processing results"""
     try:
-        # Get all documents from MCP
-        mcp_result = await execute_mcp_tool("list_all_documents", {})
+        # Get database client
+        if request.database == "remember_db":
+            client = get_client()
+        else:
+            db_path = Path.home() / request.database
+            client = chromadb.PersistentClient(path=str(db_path))
         
-        if not mcp_result.get("success"):
-            return {"success": False, "error": "Failed to load documents from MCP"}
+        # Get selected documents from database
+        documents = []
+        collections = client.list_collections()
         
-        documents = mcp_result.get("documents", [])
+        for collection in collections:
+            collection_data = client.get_collection(collection.name)
+            data = collection_data.get(include=["metadatas"])
+            
+            if data["ids"]:
+                for i, doc_id in enumerate(data["ids"]):
+                    if doc_id in request.selected_files:
+                        metadata = data["metadatas"][i] if data["metadatas"] else {}
+                        documents.append({
+                            "id": doc_id,
+                            "title": metadata.get("title", doc_id),
+                            "url": metadata.get("url", ""),
+                            "markdown_file": metadata.get("markdown_file", "")
+                        })
+        
         if not documents:
-            return {"success": False, "error": "No documents found in MCP database"}
+            error_data = {"type": "error", "error": "No selected documents found in database", "success": False}
+            yield f"data: {json.dumps(error_data)}\n\n"
+            return
         
         # Create batch results directory
         batch_dir = Path.home() / "remember" / "batch_results"
@@ -161,13 +192,16 @@ async def batch_process_handler(request: BatchProcessRequest):
                     failed_count += 1
                     continue
                 
-                # Load master contexts (use service_defects by default for batch)
+                # Load selected master context
                 master_context_content = ""
-                contexts_dir = Path.home() / "remember" / "master_contexts"
-                context_file = contexts_dir / "service_defects.txt"
-                if context_file.exists():
-                    with open(context_file, 'r', encoding='utf-8') as f:
-                        master_context_content = f.read()
+                if request.master_context:
+                    contexts_dir = Path.home() / "remember" / "master_contexts"
+                    context_file = contexts_dir / f"{request.master_context}.txt"
+                    if context_file.exists():
+                        with open(context_file, 'r', encoding='utf-8') as f:
+                            master_context_content = f.read()
+                    else:
+                        print(f"⚠️ Master context file not found: {context_file}")
 
                 # Create system prompt for this document
                 system_prompt = f"""You are a legal AI expert analyzing document {doc_id}.
@@ -237,6 +271,18 @@ Analyze this document according to the master context instructions and the analy
                     batch_results.append(result_data)
                     processed_count += 1
                     
+                    # Stream the response to UI
+                    stream_data = {
+                        "type": "response",
+                        "document_id": doc_id,
+                        "title": title,
+                        "content": response,
+                        "processed": processed_count,
+                        "total": len(documents),
+                        "success": True
+                    }
+                    yield f"data: {json.dumps(stream_data)}\n\n"
+                    
                 else:
                     failed_count += 1
                     # Save failure record
@@ -251,6 +297,19 @@ Analyze this document according to the master context instructions and the analy
                     failure_file = batch_session_dir / f"{doc_id}_error.json"
                     with open(failure_file, 'w', encoding='utf-8') as f:
                         json.dump(failure_data, f, indent=2)
+                    
+                    # Stream the error
+                    stream_data = {
+                        "type": "error",
+                        "document_id": doc_id,
+                        "title": title,
+                        "error": debug,
+                        "processed": processed_count,
+                        "failed": failed_count,
+                        "total": len(documents),
+                        "success": False
+                    }
+                    yield f"data: {json.dumps(stream_data)}\n\n"
                 
             except Exception as e:
                 failed_count += 1
@@ -273,6 +332,13 @@ Analyze this document according to the master context instructions and the analy
         summary_file = batch_session_dir / "batch_summary.json"
         with open(summary_file, 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2)
+        
+        # Import batch results to database
+        try:
+            import_result = import_extraction_session(str(summary_file))
+            print(f"✅ Imported batch results to database: {import_result}")
+        except Exception as e:
+            print(f"⚠️ Failed to import to database: {e}")
         
         # Create combined markdown report
         report_file = batch_session_dir / "batch_report.md"
@@ -306,20 +372,539 @@ Analyze this document according to the master context instructions and the analy
 ---
 """)
         
-        return {
-            "success": True,
-            "result": f"✅ Batch processing completed!\n\n📊 **Results:**\n- Processed: {processed_count}/{len(documents)} documents\n- Success Rate: {(processed_count/len(documents)*100):.1f}%\n- Failed: {failed_count}\n\n💾 **Auto-saved to:**\n- {batch_session_dir}\n- Individual analyses: {processed_count} JSON + MD files\n- Combined report: batch_report.md\n- Summary: batch_summary.json",
+        # Stream final summary
+        final_summary = {
+            "type": "complete",
             "batch_session": f"batch_{timestamp}",
+            "batch_directory": str(batch_session_dir),
             "processed_count": processed_count,
             "failed_count": failed_count,
             "total_documents": len(documents),
-            "batch_directory": str(batch_session_dir)
+            "success_rate": (processed_count/len(documents)*100) if len(documents) > 0 else 0
         }
+        yield f"data: {json.dumps(final_summary)}\n\n"
         
     except Exception as e:
         import traceback
         print(traceback.format_exc())
-        return {"success": False, "error": f"Batch processing failed: {str(e)}"}
+        error_data = {
+            "type": "error",
+            "error": f"Batch processing failed: {str(e)}",
+            "success": False
+        }
+        yield f"data: {json.dumps(error_data)}\n\n"
+
+@app.post("/api/batch_process")
+async def batch_process_stream(request: BatchProcessRequest):
+    """Stream batch processing results in real-time"""
+    return StreamingResponse(
+        batch_process_generator(request),
+        media_type="text/plain",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+    )
+
+async def execute_mcp_tool(tool_name: str, params: dict):
+    """Execute MCP tool function"""
+    try:
+        if tool_name == "get_document_by_id":
+            document_id = params.get("document_id")
+            if not document_id:
+                return {"success": False, "error": "Missing document_id parameter"}
+            
+            # Get from database
+            client = get_client()
+            collections = client.list_collections()
+            
+            for collection in collections:
+                collection_data = client.get_collection(collection.name)
+                try:
+                    result = collection_data.get(
+                        ids=[document_id], 
+                        include=["documents", "metadatas"]
+                    )
+                    if result["documents"] and result["documents"][0]:
+                        return {
+                            "success": True,
+                            "document": {
+                                "id": document_id,
+                                "content": result["documents"][0],
+                                "metadata": result["metadatas"][0] if result["metadatas"] else {}
+                            }
+                        }
+                except:
+                    continue
+            
+            return {"success": False, "error": f"Document {document_id} not found"}
+            
+        elif tool_name == "list_all_documents":
+            # Get all documents from database
+            client = get_client()
+            collections = client.list_collections()
+            documents = []
+            
+            for collection in collections:
+                collection_data = client.get_collection(collection.name)
+                data = collection_data.get(include=["metadatas"])
+                
+                if data["ids"]:
+                    for i, doc_id in enumerate(data["ids"]):
+                        metadata = data["metadatas"][i] if data["metadatas"] else {}
+                        documents.append({
+                            "id": doc_id,
+                            "title": metadata.get("title", doc_id),
+                            "url": metadata.get("url", ""),
+                            "collection": collection.name
+                        })
+            
+            return {"success": True, "documents": documents}
+        
+        else:
+            return {"success": False, "error": f"Unknown tool: {tool_name}"}
+            
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/chat")
+async def chat_with_files(request: ChatRequest):
+    """Process chat request through Remember system with MCP tools"""
+    try:
+        # Build master context from files
+        master_context_content = ""
+        if request.master_contexts:
+            contexts_dir = Path.home() / "remember" / "master_contexts"
+            for context_name in request.master_contexts:
+                context_file = contexts_dir / f"{context_name}.txt"
+                if context_file.exists():
+                    with open(context_file, 'r', encoding='utf-8') as f:
+                        master_context_content += f"\n\n=== {context_name.upper()} CONTEXT ===\n{f.read()}"
+        
+        # Create system prompt with vector IDs only (no raw content)
+        system_prompt = f"You are an expert legal AI assistant with access to MCP database tools."
+        
+        if master_context_content:
+            system_prompt += f"\n\nMASTER CONTEXTS:{master_context_content}"
+        
+        system_prompt += f"\n\nCONTEXT MODE: {request.context_mode.upper()}"
+        if request.context_mode == "fresh":
+            system_prompt += " - Provide fresh analysis without referencing previous conversations."
+        else:
+            system_prompt += " - Continue the conversation with memory of previous context."
+        
+        # Add available vector IDs (not content)
+        system_prompt += f"\n\nAVAILABLE DOCUMENTS (use get_document_by_id tool to access):"
+        for file_id in request.files:
+            system_prompt += f"\n- Vector ID: {file_id}"
+        
+        system_prompt += f"\n\nUSE THE get_document_by_id TOOL to access document content by vector ID when needed for analysis."
+        
+        # Define MCP tools for LLM
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "get_document_by_id",
+                    "description": "Get document content from MCP database by vector ID",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "document_id": {
+                                "type": "string",
+                                "description": "The vector ID of the document to retrieve (e.g., doc_001)"
+                            }
+                        },
+                        "required": ["document_id"]
+                    }
+                }
+            }
+        ]
+        
+        # Create messages for LLM
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": request.message}
+        ]
+        
+        # Log the request
+        session_id = f"chat_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        log_llm_interaction("chat_request", {
+            "messages": messages,
+            "tools": tools,
+            "model": request.provider,
+            "context_mode": request.context_mode,
+            "files": request.files
+        }, session_id)
+        
+        # Use function calling with MCP tools
+        success, response_data, debug = groq_client.function_call_chat(
+            messages=messages,
+            tools=tools,
+            model=request.provider
+        )
+        
+        # Log the response
+        log_llm_interaction("chat_response", {
+            "success": success,
+            "response_data": response_data,
+            "debug": debug
+        }, session_id)
+        
+        if success:
+            print(f"🔍 Debug - Response data type: {type(response_data)}")
+            print(f"🔍 Debug - Response data: {response_data}")
+            
+            # Check if response has tool_calls (function calling response)
+            if hasattr(response_data, 'tool_calls') or (isinstance(response_data, dict) and "tool_calls" in response_data):
+                # Process tool calls
+                if hasattr(response_data, 'tool_calls'):
+                    tool_calls = response_data.tool_calls
+                else:
+                    tool_calls = response_data["tool_calls"]
+                
+                # Add assistant message with tool calls to conversation
+                messages.append({
+                    "role": "assistant", 
+                    "tool_calls": [
+                        {
+                            "id": call.id if hasattr(call, 'id') else call["id"],
+                            "type": "function",
+                            "function": {
+                                "name": call.function.name if hasattr(call, 'function') else call["function"]["name"],
+                                "arguments": call.function.arguments if hasattr(call, 'function') else call["function"]["arguments"]
+                            }
+                        } for call in tool_calls
+                    ]
+                })
+                
+                # Execute each tool call
+                for tool_call in tool_calls:
+                    if hasattr(tool_call, 'function'):
+                        tool_name = tool_call.function.name
+                        tool_args = json.loads(tool_call.function.arguments)
+                        tool_id = tool_call.id
+                    else:
+                        tool_name = tool_call["function"]["name"]
+                        tool_args = json.loads(tool_call["function"]["arguments"])
+                        tool_id = tool_call["id"]
+                    
+                    print(f"🛠️ Executing tool: {tool_name} with args: {tool_args}")
+                    
+                    # Execute MCP tool
+                    tool_result = await execute_mcp_tool(tool_name, tool_args)
+                    print(f"🛠️ Tool result: {tool_result}")
+                    
+                    # Log tool execution
+                    log_llm_interaction("tool_execution", {
+                        "tool_name": tool_name,
+                        "tool_args": tool_args,
+                        "tool_result": tool_result
+                    }, session_id)
+                    
+                    # Add tool response to conversation
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "name": tool_name,
+                        "content": json.dumps(tool_result)
+                    })
+                
+                # Get final response with tool results
+                final_success, final_response, final_debug = groq_client.conversation_chat(
+                    messages=messages,
+                    model=request.provider
+                )
+                
+                # Log final response
+                log_llm_interaction("final_response", {
+                    "success": final_success,
+                    "response": final_response,
+                    "debug": final_debug
+                }, session_id)
+                
+                if final_success:
+                    # Add file information to response
+                    file_info = "\n\n📁 **Files Analyzed:**\n"
+                    for file_id in request.files:
+                        file_info += f"- Vector ID: `{file_id}`\n"
+                    
+                    enhanced_response = f"{final_response}\n{file_info}"
+                    
+                    return {
+                        "success": True,
+                        "response": enhanced_response,
+                        "context_mode": request.context_mode,
+                        "files_processed": len(request.files),
+                        "processed_files": request.files,
+                        "debug_info": final_debug if final_debug else None
+                    }
+                else:
+                    raise HTTPException(status_code=500, detail=f"Final response failed: {final_debug}")
+            else:
+                # Direct response without tool calls
+                content = ""
+                if hasattr(response_data, 'content'):
+                    content = response_data.content
+                elif isinstance(response_data, dict):
+                    # Handle OpenAI-style response format
+                    if "choices" in response_data and len(response_data["choices"]) > 0:
+                        choice = response_data["choices"][0]
+                        if "message" in choice and "content" in choice["message"]:
+                            content = choice["message"]["content"]
+                    elif "content" in response_data:
+                        content = response_data["content"]
+                    else:
+                        content = str(response_data)
+                elif isinstance(response_data, str):
+                    content = response_data
+                else:
+                    content = str(response_data)
+                
+                # Add file information to response
+                file_info = "\n\n📁 **Files Analyzed:**\n"
+                for file_id in request.files:
+                    file_info += f"- Vector ID: `{file_id}`\n"
+                
+                enhanced_content = f"{content}\n{file_info}"
+                
+                return {
+                    "success": True,
+                    "response": enhanced_content,
+                    "context_mode": request.context_mode,
+                    "files_processed": len(request.files),
+                    "processed_files": request.files,
+                    "debug_info": debug if debug else None
+                }
+        else:
+            raise HTTPException(status_code=500, detail=f"LLM processing failed: {debug}")
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/databases")
+async def get_databases():
+    """Get all available ChromaDB databases"""
+    try:
+        # Scan for available databases
+        databases = []
+        
+        # Default remember database
+        try:
+            client = get_client()
+            collections = client.list_collections()
+            
+            total_docs = 0
+            for collection in collections:
+                collection_data = client.get_collection(collection.name)
+                count = collection_data.count()
+                total_docs += count
+            
+            databases.append({
+                "name": "remember_db",
+                "path": str(Path.home() / "remember_db"),
+                "collections": len(collections),
+                "documents": total_docs,
+                "type": "primary"
+            })
+        except Exception as e:
+            print(f"⚠️ Could not access remember_db: {e}")
+        
+        return {"databases": databases}
+        
+    except Exception as e:
+        return {"databases": [], "error": str(e)}
+
+@app.get("/api/database/{database_name}/files")
+async def get_database_files(database_name: str):
+    """Get files from specific database"""
+    try:
+        if database_name == "remember_db":
+            client = get_client()
+        else:
+            db_path = Path.home() / database_name
+            client = chromadb.PersistentClient(path=str(db_path))
+        
+        collections = client.list_collections()
+        files = []
+        
+        for collection in collections:
+            collection_data = client.get_collection(collection.name)
+            data = collection_data.get(include=["metadatas"])
+            
+            if data["ids"]:
+                for i, doc_id in enumerate(data["ids"]):
+                    metadata = data["metadatas"][i] if data["metadatas"] else {}
+                    
+                    files.append({
+                        "id": doc_id,
+                        "collection": collection.name,
+                        "title": metadata.get("title", doc_id),
+                        "url": metadata.get("url", ""),
+                        "markdown_file": metadata.get("markdown_file", ""),
+                        "type": metadata.get("type", "document"),
+                        "size": len(str(metadata)),
+                        "created": metadata.get("created", "unknown"),
+                        "rating": metadata.get("rating", 0)
+                    })
+        
+        return {"files": files}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+@app.get("/api/master_contexts")
+async def get_master_contexts():
+    """Get all available master context files"""
+    try:
+        contexts_dir = Path.home() / "remember" / "master_contexts"
+        contexts = []
+        
+        if contexts_dir.exists():
+            for file_path in contexts_dir.glob("*.txt"):
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                contexts.append({
+                    "name": file_path.stem,
+                    "filename": file_path.name,
+                    "content": content,
+                    "size": len(content)
+                })
+        
+        return {"contexts": contexts}
+        
+    except Exception as e:
+        return {"contexts": [], "error": str(e)}
+
+@app.get("/api/view_markdown")
+async def view_markdown_file(file_path: str = Query(...)):
+    """View markdown file content"""
+    try:
+        markdown_path = Path(file_path)
+        
+        # Security check - ensure file exists and is readable
+        if not markdown_path.exists():
+            raise HTTPException(status_code=404, detail="Markdown file not found")
+        
+        if not markdown_path.suffix.lower() in ['.md', '.txt']:
+            raise HTTPException(status_code=400, detail="Only markdown and text files are supported")
+        
+        # Read file content
+        with open(markdown_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        
+        # Return as HTML page
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Markdown Viewer - {markdown_path.name}</title>
+            <style>
+                body {{ 
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    max-width: 900px; margin: 20px auto; padding: 20px;
+                    background: #1e1e1e; color: #d4d4d4;
+                    line-height: 1.6;
+                }}
+                h1, h2, h3 {{ color: #00ff00; }}
+                pre {{ 
+                    background: #2a2a2a; padding: 15px; border-radius: 5px;
+                    overflow-x: auto; border: 1px solid #333;
+                }}
+                code {{ 
+                    background: #2a2a2a; padding: 2px 4px; border-radius: 3px;
+                    color: #ff6b6b;
+                }}
+                blockquote {{ 
+                    border-left: 4px solid #00ff00; padding-left: 20px;
+                    margin: 20px 0; font-style: italic;
+                }}
+                .file-path {{
+                    color: #888; font-size: 0.9em; margin-bottom: 20px;
+                    font-family: monospace;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="file-path">📄 {file_path}</div>
+            <pre style="white-space: pre-wrap; font-size: 14px;">{content}</pre>
+        </body>
+        </html>
+        """
+        
+        return HTMLResponse(content=html_content)
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading file: {str(e)}")
+
+@app.get("/api/view_file")
+async def view_file(file_id: str = Query(...), database: str = Query(...)):
+    """View file content from database"""
+    try:
+        # Get database client
+        if database == "remember_db":
+            client = get_client()
+        else:
+            db_path = Path.home() / database
+            client = chromadb.PersistentClient(path=str(db_path))
+        
+        # Find the file in collections
+        collections = client.list_collections()
+        
+        for collection in collections:
+            collection_data = client.get_collection(collection.name)
+            data = collection_data.get(include=["documents", "metadatas"], ids=[file_id])
+            
+            if data["ids"] and len(data["ids"]) > 0:
+                document = data["documents"][0] if data["documents"] else ""
+                metadata = data["metadatas"][0] if data["metadatas"] else {}
+                
+                title = metadata.get("title", file_id)
+                url = metadata.get("url", "")
+                
+                html_content = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="UTF-8">
+                    <title>Document Viewer - {title}</title>
+                    <style>
+                        body {{ 
+                            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                            max-width: 900px; margin: 20px auto; padding: 20px;
+                            background: #1e1e1e; color: #d4d4d4;
+                            line-height: 1.6;
+                        }}
+                        h1, h2, h3 {{ color: #00ff00; }}
+                        .metadata {{
+                            background: #2a2a2a; padding: 15px; border-radius: 5px;
+                            margin-bottom: 20px; border: 1px solid #333;
+                        }}
+                        .content {{
+                            background: #1a1a1a; padding: 20px; border-radius: 5px;
+                            border: 1px solid #333; white-space: pre-wrap;
+                            max-height: 70vh; overflow-y: auto;
+                        }}
+                    </style>
+                </head>
+                <body>
+                    <h1>📄 {title}</h1>
+                    <div class="metadata">
+                        <strong>Vector ID:</strong> {file_id}<br>
+                        <strong>Collection:</strong> {collection.name}<br>
+                        <strong>URL:</strong> {url}<br>
+                        <strong>Content Length:</strong> {len(document):,} characters
+                    </div>
+                    <div class="content">{document}</div>
+                </body>
+                </html>
+                """
+                
+                return HTMLResponse(content=html_content)
+        
+        raise HTTPException(status_code=404, detail=f"File {file_id} not found in database {database}")
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error viewing file: {str(e)}")
 
 @app.get("/api/download_batch_summary/{batch_session}")
 async def download_batch_summary(batch_session: str):
@@ -409,6 +994,32 @@ async def serve_remember_ui():
         
         .file-item:hover { background: #2a2a2a; }
         .file-item.selected { background: #0a4a0a; border-color: #00ff00; }
+        .file-item.processed { border-left: 4px solid #00bfff; background: #0a1a2a; }
+        .file-item.saved { border-left: 4px solid #00ff00; background: #0a2a0a; }
+        
+        .file-status {
+            position: absolute; top: 5px; left: 5px;
+            font-size: 10px; padding: 1px 4px; border-radius: 2px;
+            background: rgba(0, 0, 0, 0.7);
+        }
+        
+        .status-processed { color: #00bfff; }
+        .status-saved { color: #00ff00; }
+        
+        .response-info {
+            margin-top: 8px; padding: 6px; 
+            background: rgba(0, 255, 0, 0.1); 
+            border-left: 2px solid #00ff00;
+            font-size: 9px; color: #00ff00;
+        }
+        
+        .response-info a {
+            color: #00bfff; text-decoration: none;
+        }
+        
+        .response-info a:hover {
+            text-decoration: underline;
+        }
         
         .file-name { 
             font-size: 10px; color: #00ff00; font-weight: bold; 
@@ -789,7 +1400,7 @@ async def serve_remember_ui():
                         <option value="moonshotai/kimi-k2-instruct">🌙 Kimi K2 Instruct - 131K Context</option>
                         <option value="meta-llama/llama-4-scout-17b-16e-instruct">🔍 Llama 4 Scout (17B) - 131K Context</option>
                         <option value="meta-llama/llama-4-maverick-17b-128e-instruct">⚡ Llama 4 Maverick (17B) - 131K Context</option>
-                        <option value="deepseek-r1-distill-llama-70b">🧠 DeepSeek R1 Distill (70B) - 131K Context</option>
+                        <option value="deepseek-r1-distill-llama-70b" selected>🧠 DeepSeek R1 Distill (70B) - 131K Context</option>
                         <option value="llama-3.3-70b-versatile">🦙 Llama 3.3 70B Versatile - 131K Context</option>
                     </optgroup>
                     <optgroup label="High Performance">
@@ -864,34 +1475,7 @@ async def serve_remember_ui():
                     <button class="btn" style="font-size: 8px; padding: 2px 6px;" onclick="showContextManager()">⚙️ Manage</button>
                 </div>
                 <div id="context-list">
-                    <div class="context-item">
-                        <input type="checkbox" id="ctx-service" value="service_defects">
-                        <label for="ctx-service">Service of Process Expert</label>
-                        <button class="context-btn" onclick="viewContext('service_defects')">👁️</button>
-                        <button class="context-btn" onclick="editContext('service_defects')">✏️</button>
-                        <button class="context-btn" onclick="sendContextToLLM('service_defects')">🤖</button>
-                    </div>
-                    <div class="context-item">
-                        <input type="checkbox" id="ctx-tpa" value="tpa_violations">
-                        <label for="ctx-tpa">TPA Violation Specialist</label>
-                        <button class="context-btn" onclick="viewContext('tpa_violations')">👁️</button>
-                        <button class="context-btn" onclick="editContext('tpa_violations')">✏️</button>
-                        <button class="context-btn" onclick="sendContextToLLM('tpa_violations')">🤖</button>
-                    </div>
-                    <div class="context-item">
-                        <input type="checkbox" id="ctx-court" value="court_procedure">
-                        <label for="ctx-court">Court Procedure Guide</label>
-                        <button class="context-btn" onclick="viewContext('court_procedure')">👁️</button>
-                        <button class="context-btn" onclick="editContext('court_procedure')">✏️</button>
-                        <button class="context-btn" onclick="sendContextToLLM('court_procedure')">🤖</button>
-                    </div>
-                    <div class="context-item">
-                        <input type="checkbox" id="ctx-timeline" value="case_timeline">
-                        <label for="ctx-timeline">Case Timeline Master</label>
-                        <button class="context-btn" onclick="viewContext('case_timeline')">👁️</button>
-                        <button class="context-btn" onclick="editContext('case_timeline')">✏️</button>
-                        <button class="context-btn" onclick="sendContextToLLM('case_timeline')">🤖</button>
-                    </div>
+                    <!-- Dynamically loaded from master_contexts directory -->
                 </div>
             </div>
             
@@ -931,13 +1515,21 @@ async def serve_remember_ui():
                 </div>
             </div>
             
+            <!-- Master Context Selector -->
+            <div style="margin-bottom: 15px;">
+                <label for="master-context-select" style="display: block; margin-bottom: 5px; color: #00ff00; font-size: 12px;">📋 Master Context:</label>
+                <select id="master-context-select" style="width: 100%; padding: 5px; background: #2a2a2a; color: #00ff00; border: 1px solid #333; border-radius: 3px; font-size: 11px;">
+                    <option value="">Select master context...</option>
+                </select>
+            </div>
+            
             <!-- MCP Mode Controls -->
             <div id="mcp-mode-controls" style="margin-bottom: 15px; display: flex; gap: 5px; flex-wrap: wrap;">
                 <button class="btn extract" id="extract-urls-btn">
                     🚀 Extract URLs
                 </button>
                 <button class="btn batch" id="batch-process-btn" disabled>
-                    Batch Process All
+                    Batch Process Selected
                 </button>
             </div>
             
@@ -985,7 +1577,7 @@ async def serve_remember_ui():
                                     <option value="moonshotai/kimi-k2-instruct">🌙 Kimi K2 Instruct - 131K Context</option>
                                     <option value="meta-llama/llama-4-scout-17b-16e-instruct">🔍 Llama 4 Scout (17B) - 131K Context</option>
                                     <option value="meta-llama/llama-4-maverick-17b-128e-instruct">⚡ Llama 4 Maverick (17B) - 131K Context</option>
-                                    <option value="deepseek-r1-distill-llama-70b">🧠 DeepSeek R1 Distill (70B) - 131K Context</option>
+                                    <option value="deepseek-r1-distill-llama-70b" selected>🧠 DeepSeek R1 Distill (70B) - 131K Context</option>
                                     <option value="llama-3.3-70b-versatile" selected>🦙 Llama 3.3 70B Versatile - 131K Context</option>
                                     <option value="llama-3.1-8b-instant">🚀 Llama 3.1 8B Instant - 131K Context</option>
                                     <option value="gemma2-9b-it">💎 Gemma2 9B IT - 8K Context</option>
@@ -1075,6 +1667,9 @@ Click "🚀 Extract URLs" to scrape from urls.txt and auto-import to database!</
         let extractionInterval = null;
         let currentContextId = null;
         let lastSessionId = null;
+        let processedFiles = new Set(); // Track files that have been processed
+        let savedFiles = new Set(); // Track files that have been saved to MCP
+        let fileResponseInfo = new Map(); // Store response info (fileId -> {vectorId, markdownFile})
         let currentContextContent = null;
         let currentEditFile = null;
         let noProcessList = new Set();
@@ -1082,6 +1677,7 @@ Click "🚀 Extract URLs" to scrape from urls.txt and auto-import to database!</
 
         // Initialize
         loadDatabases();
+        loadMasterContexts();
         
         // Event Listeners
         document.getElementById('send-btn').addEventListener('click', sendMessage);
@@ -1141,6 +1737,46 @@ Click "🚀 Extract URLs" to scrape from urls.txt and auto-import to database!</
             document.getElementById('batch-process-btn').disabled = false;
             document.getElementById('refresh-files-btn').disabled = false;
             updateCurrentContext();
+        }
+        
+        async function loadMasterContexts() {
+            try {
+                const response = await fetch('/api/master_contexts');
+                const data = await response.json();
+                
+                // Update dropdown selector
+                const select = document.getElementById('master-context-select');
+                select.innerHTML = '<option value="">Select master context...</option>';
+                
+                // Update context list with checkboxes and buttons
+                const contextList = document.getElementById('context-list');
+                contextList.innerHTML = '';
+                
+                data.contexts.forEach(context => {
+                    // Add to dropdown
+                    const option = document.createElement('option');
+                    option.value = context.name;
+                    option.textContent = `📋 ${context.name} (${context.size} chars)`;
+                    if (context.name === 'service_defects') {
+                        option.selected = true;
+                    }
+                    select.appendChild(option);
+                    
+                    // Add to context list
+                    const contextItem = document.createElement('div');
+                    contextItem.className = 'context-item';
+                    contextItem.innerHTML = `
+                        <input type="checkbox" id="ctx-${context.name}" value="${context.name}">
+                        <label for="ctx-${context.name}">${context.name}</label>
+                        <button class="context-btn" onclick="viewContext('${context.name}')">👁️</button>
+                        <button class="context-btn" onclick="editContext('${context.name}')">✏️</button>
+                        <button class="context-btn" onclick="sendContextToLLM('${context.name}')">🤖</button>
+                    `;
+                    contextList.appendChild(contextItem);
+                });
+            } catch (error) {
+                console.error('Error loading master contexts:', error);
+            }
         }
         
         async function loadFiles(dbName) {
@@ -1276,6 +1912,18 @@ Click "🚀 Extract URLs" to scrape from urls.txt and auto-import to database!</
                         fileList.appendChild(fileDiv);
                     });
                 }
+                
+                // Maintain visual state after rendering
+                maintainFileSelection();
+                
+                // Re-apply processed and saved status
+                processedFiles.forEach(fileId => markFileAsProcessed(fileId));
+                savedFiles.forEach(fileId => markFileAsSaved(fileId));
+                
+                // Re-apply nested response info
+                fileResponseInfo.forEach((info, fileId) => {
+                    addNestedResponseInfo(fileId, info.vectorId, info.markdownFile);
+                });
             });
         }
         
@@ -1507,6 +2155,14 @@ Click "🚀 Extract URLs" to scrape from urls.txt and auto-import to database!</
                
                addMessage('assistant', data.response);
                
+               // Mark processed files
+               if (data.processed_files && data.processed_files.length > 0) {
+                   data.processed_files.forEach(fileId => {
+                       processedFiles.add(fileId);
+                       markFileAsProcessed(fileId);
+                   });
+               }
+               
                // Show function call results if available
                if (data.function_calls && data.function_calls.length > 0) {
                    displayFunctionResults(data.function_calls);
@@ -1524,16 +2180,34 @@ Click "🚀 Extract URLs" to scrape from urls.txt and auto-import to database!</
        async function startBatchProcess() {
            if (!currentDatabase) return;
            
-           const prompt = window.prompt('Enter analysis prompt for batch processing:', 
-               'LEGAL RESEARCH ANALYSIS PROMPT:\n"You are a California legal expert analyzing documents for service of process defects in an unlawful detainer case. The defendant was substitute served on June 20th but claims the service was defective and fraudulent.\nANALYZE these documents for ALL possible legal challenges to service of process, focusing on California CCP 415.20(b) substitute service requirements.\nCASE FACTS: Defendant at work during service, girlfriend received papers, missing documents discovered June 22nd, waited for required certified mail that never came, court filed proof claiming PERSONAL service (fraud), default judgment entered.\nEXTRACT every legal angle that could challenge this service, including jurisdiction arguments, procedural defects, fraud claims, due process violations, and any uncommon legal theories.\nFocus on case-winning arguments with solid legal foundation."');
+           const prompt = window.prompt('Enter analysis prompt for batch processing:', 'LEGAL RESEARCH ANALYSIS PROMPT:\\n"You are a California legal expert analyzing documents for service of process defects in an unlawful detainer case. The defendant was substitute served on June 20th but claims the service was defective and fraudulent.\\nANALYZE these documents for ALL possible legal challenges to service of process, focusing on California CCP 415.20(b) substitute service requirements.\\nCASE FACTS: Defendant at work during service, girlfriend received papers, missing documents discovered June 22nd, waited for required certified mail that never came, court filed proof claiming PERSONAL service (fraud), default judgment entered.\\nEXTRACT every legal angle that could challenge this service, including jurisdiction arguments, procedural defects, fraud claims, due process violations, and any uncommon legal theories.\\nFocus on case-winning arguments with solid legal foundation."');
            
            if (!prompt) return;
            
            addMessage('system', `🚀 Starting batch processing with DeepSeek R1...`);
            addMessage('system', `📋 Analysis Prompt: ${prompt.substring(0, 200)}...`);
            
+           // Get selected files
+           const selectedFiles = [];
+           document.querySelectorAll('.file-checkbox:checked').forEach(cb => {
+               selectedFiles.push(cb.value);
+           });
+           
+           if (selectedFiles.length === 0) {
+               alert('Please select files to process');
+               return;
+           }
+           
+           const masterContext = document.getElementById('master-context-select').value;
+           if (!masterContext) {
+               alert('Please select a master context');
+               return;
+           }
+           
            const requestData = {
                database: currentDatabase,
+               selected_files: selectedFiles,
+               master_context: masterContext,
                analysis_prompt: prompt,
                processing_mode: 'batch',
                provider: document.getElementById('provider-select').value || 'deepseek-r1-distill-llama-70b',
@@ -1541,7 +2215,7 @@ Click "🚀 Extract URLs" to scrape from urls.txt and auto-import to database!</
            };
            
            try {
-               addMessage('system', '⏳ Processing all documents... This may take several minutes.');
+               addMessage('system', '⏳ Starting batch processing... Responses will stream in real-time.');
                
                const response = await fetch('/api/batch_process', {
                    method: 'POST',
@@ -1549,43 +2223,58 @@ Click "🚀 Extract URLs" to scrape from urls.txt and auto-import to database!</
                    body: JSON.stringify(requestData)
                });
                
-               if (!response.ok) {
-                   const errorData = await response.json();
-                   throw new Error(errorData.detail || 'Server error');
+               const reader = response.body.getReader();
+               const decoder = new TextDecoder();
+               
+               while (true) {
+                   const { done, value } = await reader.read();
+                   if (done) break;
+                   
+                   const chunk = decoder.decode(value);
+                   const lines = chunk.split('\\n');
+                   
+                   for (const line of lines) {
+                       if (line.startsWith('data: ')) {
+                           try {
+                               const data = JSON.parse(line.slice(6));
+                               
+                               if (data.type === 'response') {
+                                   addMessage('system', `📄 Processing: ${data.title} (${data.processed}/${data.total})`);
+                                   addMessage('assistant', data.content);
+                               } else if (data.type === 'error') {
+                                   addMessage('system', `❌ Error processing ${data.title}: ${data.error}`);
+                               } else if (data.type === 'complete') {
+                                   addMessage('system', `✅ Batch complete! Processed: ${data.processed_count}/${data.total_documents} (${data.success_rate.toFixed(1)}% success)`);
+                                   
+                                   // Add download buttons
+                                   const chatMessages = document.getElementById('chat-messages');
+                                   const lastMessage = chatMessages.lastElementChild;
+                                   
+                                   const actionsDiv = document.createElement('div');
+                                   actionsDiv.style.cssText = 'margin-top: 10px; display: flex; gap: 5px; flex-wrap: wrap;';
+                                   
+                                   const viewDirBtn = document.createElement('button');
+                                   viewDirBtn.textContent = '📁 Open Results Folder';
+                                   viewDirBtn.className = 'btn';
+                                   viewDirBtn.onclick = () => {
+                                       alert('Results saved to: ' + data.batch_directory + '\\n\\nFiles created:\\n- Individual analyses: ' + data.processed_count + ' JSON + MD files\\n- Combined report: batch_report.md\\n- Summary: batch_summary.json');
+                                   };
+                                   
+                                   const downloadBtn = document.createElement('button');
+                                   downloadBtn.textContent = '💾 Download Summary';
+                                   downloadBtn.className = 'btn';
+                                   downloadBtn.onclick = () => downloadBatchSummary(data.batch_session);
+                                   
+                                   actionsDiv.appendChild(viewDirBtn);
+                                   actionsDiv.appendChild(downloadBtn);
+                                   lastMessage.appendChild(actionsDiv);
+                               }
+                           } catch (parseError) {
+                               console.error('Error parsing stream data:', parseError);
+                           }
+                       }
+                   }
                }
-               
-               const data = await response.json();
-               
-               if (data.success) {
-                   addMessage('assistant', data.result);
-                   
-                   // Add buttons to view batch results
-                   const chatMessages = document.getElementById('chat-messages');
-                   const lastMessage = chatMessages.lastElementChild;
-                   
-                   const actionsDiv = document.createElement('div');
-                   actionsDiv.style.cssText = 'margin-top: 10px; display: flex; gap: 5px; flex-wrap: wrap;';
-                   
-                   const viewDirBtn = document.createElement('button');
-                   viewDirBtn.textContent = '📁 Open Results Folder';
-                   viewDirBtn.className = 'btn';
-                   viewDirBtn.onclick = () => {
-                       // Show path to user
-                       alert(`Results saved to: ${data.batch_directory}\n\nFiles created:\n- Individual analyses: ${data.processed_count} JSON + MD files\n- Combined report: batch_report.md\n- Summary: batch_summary.json`);
-                   };
-                   
-                   const downloadBtn = document.createElement('button');
-                   downloadBtn.textContent = '💾 Download Summary';
-                   downloadBtn.className = 'btn';
-                   downloadBtn.onclick = () => downloadBatchSummary(data.batch_session);
-                   
-                   actionsDiv.appendChild(viewDirBtn);
-                   actionsDiv.appendChild(downloadBtn);
-                   lastMessage.appendChild(actionsDiv);
-               } else {
-                   addMessage('system', `❌ Batch processing failed: ${data.error}`);
-               }
-               
            } catch (error) {
                addMessage('system', `❌ Batch process error: ${error.message}`);
            }
@@ -1918,11 +2607,8 @@ Click "🚀 Extract URLs" to scrape from urls.txt and auto-import to database!</
            if (!currentEditFile) return;
            
            const content = document.getElementById('file-editor-textarea').value;
-           const saveBtn = document.getElementById('auto-save-btn');
            
            try {
-               saveBtn.textContent = '💾 Saving...';
-               
                const response = await fetch('/api/auto_save_file', {
                    method: 'POST',
                    headers: {'Content-Type': 'application/json'},
@@ -1935,16 +2621,27 @@ Click "🚀 Extract URLs" to scrape from urls.txt and auto-import to database!</
                
                const data = await response.json();
                if (data.success) {
+                   // Update button text to indicate success
+                   const saveBtn = document.getElementById('auto-save-btn');
                    saveBtn.textContent = '✅ Auto Saved';
+                   setTimeout(() => {
+                       saveBtn.textContent = '💾 Auto Save';
+                   }, 2000);
+               } else {
+                   // Update button text to indicate failure
+                   const saveBtn = document.getElementById('auto-save-btn');
+                   saveBtn.textContent = '❌ Save Failed';
                    setTimeout(() => {
                        saveBtn.textContent = '💾 Auto Save';
                    }, 2000);
                }
            } catch (error) {
+               // Update button text to indicate failure
+               const saveBtn = document.getElementById('auto-save-btn');
                saveBtn.textContent = '❌ Save Failed';
                setTimeout(() => {
-                   saveBtn.textContent = '💾 Auto Save';
-               }, 2000);
+                       saveBtn.textContent = '💾 Auto Save';
+                   }, 2000);
            }
        }
        
@@ -1997,2542 +2694,343 @@ Click "🚀 Extract URLs" to scrape from urls.txt and auto-import to database!</
                        file_path: currentEditFile.markdown_file
                    })
                });
-               
                const data = await response.json();
                if (data.success) {
-                   document.getElementById('file-editor-textarea').value = data.content;
-               } else {
-                   alert(`Error loading version: ${data.error}`);
+                   document.getElementById('edit-content').value = data.content;
                }
            } catch (error) {
-               alert(`Error: ${error.message}`);
+               console.error('Error loading version:', error);
            }
        }
-       
-       function toggleNoProcess(url, button) {
-           if (noProcessList.has(url)) {
-               noProcessList.delete(url);
-               button.classList.remove('no-process');
-               button.title = 'Mark as do not process';
-           } else {
-               noProcessList.add(url);
-               button.classList.add('no-process');
-               button.title = 'Remove from do not process';
-           }
-           
-           // Save to localStorage
-           localStorage.setItem('noProcessList', JSON.stringify([...noProcessList]));
-       }
-       
-       // Load no-process list on startup
-       function loadNoProcessList() {
-           const saved = localStorage.getItem('noProcessList');
-           if (saved) {
-               noProcessList = new Set(JSON.parse(saved));
-           }
-       }
-       
-       // Call on page load
-       loadNoProcessList();
-       
-       // ===============================
-       // MASTER CONTEXT MANAGEMENT
-       // ===============================
-       
-       function showContextManager() {
-           // Create and show context manager modal
-           const modal = document.createElement('div');
-           modal.className = 'context-manager-modal';
-           modal.innerHTML = `
-               <div class="context-manager-content">
-                   <div class="context-manager-header">
-                       <span>🧠 Master Context Manager</span>
-                       <button class="btn" onclick="closeContextManager()">❌ Close</button>
-                   </div>
-                   <div class="context-manager-body">
-                       <div class="context-tabs">
-                           <button class="tab-btn active" onclick="showContextTab('list')">📋 List</button>
-                           <button class="tab-btn" onclick="showContextTab('create')">➕ Create</button>
-                           <button class="tab-btn" onclick="showContextTab('edit')">✏️ Edit</button>
-                       </div>
-                       <div id="context-tab-content">
-                           <div id="context-list-tab">Loading contexts...</div>
-                           <div id="context-create-tab" style="display: none;">
-                               <div class="create-context-form">
-                                   <label>Context Name:</label>
-                                   <input type="text" id="new-context-name" placeholder="e.g., Service_Expert">
-                                   <label>Context Content:</label>
-                                   <textarea id="new-context-content" rows="15" placeholder="Enter master context content..."></textarea>
-                                   <button class="btn primary" onclick="createNewContext()">💾 Create Context</button>
-                               </div>
-                           </div>
-                           <div id="context-edit-tab" style="display: none;">
-                               <div class="edit-context-form">
-                                   <label>Select Context to Edit:</label>
-                                   <select id="edit-context-select">
-                                       <option value="">Choose context...</option>
-                                   </select>
-                                   <label>Context Content:</label>
-                                   <textarea id="edit-context-content" rows="15" placeholder="Context content will load here..."></textarea>
-                                   <div style="display: flex; gap: 10px; margin-top: 10px;">
-                                       <button class="btn primary" onclick="saveContextChanges()">💾 Save Changes</button>
-                                       <button class="btn warning" onclick="deleteContext()">🗑️ Delete Context</button>
-                                       <button class="btn" onclick="revertContext()">↩️ Revert</button>
-                                   </div>
-                               </div>
-                           </div>
-                       </div>
-                   </div>
-               </div>
-           `;
-           
-           // Add CSS for modal
-           const style = document.createElement('style');
-           style.textContent = `
-               .context-manager-modal {
-                   position: fixed; top: 0; left: 0; width: 100%; height: 100%;
-                   background: rgba(0,0,0,0.8); z-index: 1000; display: flex;
-                   justify-content: center; align-items: center;
-               }
-               .context-manager-content {
-                   background: #1a1a1a; border: 1px solid #333; border-radius: 8px;
-                   width: 80%; max-width: 900px; height: 80%; display: flex; flex-direction: column;
-               }
-               .context-manager-header {
-                   padding: 15px; background: #2a2a2a; border-bottom: 1px solid #333;
-                   display: flex; justify-content: space-between; align-items: center;
-                   font-weight: bold; color: #00ff00;
-               }
-               .context-manager-body { flex: 1; padding: 15px; overflow: hidden; }
-               .context-tabs { display: flex; gap: 5px; margin-bottom: 15px; }
-               .tab-btn { padding: 8px 15px; background: #333; border: 1px solid #555; color: #ccc; cursor: pointer; }
-               .tab-btn.active { background: #0a4a0a; border-color: #00ff00; color: #00ff00; }
-               #context-tab-content { height: calc(100% - 60px); overflow-y: auto; }
-               .create-context-form, .edit-context-form { display: flex; flex-direction: column; gap: 10px; }
-               .create-context-form input, .create-context-form textarea,
-               .edit-context-form select, .edit-context-form textarea {
-                   background: #333; color: #00ff00; border: 1px solid #555; padding: 8px;
-                   font-family: inherit; font-size: 12px;
-               }
-               .context-item { 
-                   background: #2a2a2a; border: 1px solid #333; margin-bottom: 10px; 
-                   padding: 10px; border-radius: 4px; display: flex; justify-content: space-between; 
-               }
-               .context-info { flex: 1; }
-               .context-name { font-weight: bold; color: #00ff00; }
-               .context-meta { font-size: 10px; color: #888; margin-top: 5px; }
-               .context-actions { display: flex; gap: 5px; }
-               .context-action-btn { 
-                   padding: 2px 6px; font-size: 8px; background: #333; 
-                   border: 1px solid #555; color: #ccc; cursor: pointer; 
-               }
-           `;
-           
-           document.head.appendChild(style);
-           document.body.appendChild(modal);
-           
-           // Load initial context list
-           loadMasterContextsList();
-       }
-       
-       function closeContextManager() {
-           const modal = document.querySelector('.context-manager-modal');
-           if (modal) modal.remove();
-       }
-       
-       function showContextTab(tabName) {
-           // Update tab buttons
-           document.querySelectorAll('.tab-btn').forEach(btn => btn.classList.remove('active'));
-           event.target.classList.add('active');
-           
-           // Show/hide tab content
-           document.getElementById('context-list-tab').style.display = tabName === 'list' ? 'block' : 'none';
-           document.getElementById('context-create-tab').style.display = tabName === 'create' ? 'block' : 'none';
-           document.getElementById('context-edit-tab').style.display = tabName === 'edit' ? 'block' : 'none';
-           
-           if (tabName === 'edit') {
-               loadContextsForEdit();
-           }
-       }
-       
-       async function loadMasterContextsList() {
-           try {
-               const response = await fetch('/api/master_contexts/list');
-               const data = await response.json();
-               
-               const listTab = document.getElementById('context-list-tab');
-               if (data.success) {
-                   listTab.innerHTML = data.contexts.map(ctx => `
-                       <div class="context-item">
-                           <div class="context-info">
-                               <div class="context-name">${ctx.id}</div>
-                               <div class="context-meta">${ctx.size} chars | Modified: ${ctx.modified}</div>
-                           </div>
-                           <div class="context-actions">
-                               <button class="context-action-btn" onclick="viewContext('${ctx.id}')">👁️ View</button>
-                               <button class="context-action-btn" onclick="editContextDirect('${ctx.id}')">✏️ Edit</button>
-                               <button class="context-action-btn" onclick="deleteContextDirect('${ctx.id}')">🗑️ Delete</button>
-                           </div>
-                       </div>
-                   `).join('');
-               } else {
-                   listTab.innerHTML = '<div style="color: red;">Error loading contexts</div>';
-               }
-           } catch (error) {
-               document.getElementById('context-list-tab').innerHTML = '<div style="color: red;">Failed to load contexts</div>';
-           }
-       }
-       
-       async function loadContextsForEdit() {
-           try {
-               const response = await fetch('/api/master_contexts/list');
-               const data = await response.json();
-               
-               const select = document.getElementById('edit-context-select');
-               if (data.success) {
-                   select.innerHTML = '<option value="">Choose context...</option>' +
-                       data.contexts.map(ctx => `<option value="${ctx.id}">${ctx.id}</option>`).join('');
-               }
-           } catch (error) {
-               console.error('Failed to load contexts for edit:', error);
-           }
-       }
-       
-       async function createNewContext() {
-           const name = document.getElementById('new-context-name').value.trim();
-           const content = document.getElementById('new-context-content').value.trim();
-           
-           if (!name || !content) {
-               alert('Please provide both name and content');
-               return;
-           }
-           
-           try {
-               const response = await fetch('/api/master_contexts/create', {
-                   method: 'POST',
-                   headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify({id: name, content: content})
-               });
-               
-               const result = await response.json();
-               if (result.success) {
-                   alert('✅ Context created successfully!');
-                   document.getElementById('new-context-name').value = '';
-                   document.getElementById('new-context-content').value = '';
-                   loadMasterContextsList();
-               } else {
-                   alert(`❌ Error: ${result.error}`);
-               }
-           } catch (error) {
-               alert(`❌ Error creating context: ${error.message}`);
-           }
-       }
-       
-       // Add event listener for context selection
-       document.addEventListener('change', async function(e) {
-           if (e.target.id === 'edit-context-select') {
-               const contextId = e.target.value;
-               if (contextId) {
-                   try {
-                       const response = await fetch(`/api/master_context/${contextId}`);
-                       const data = await response.json();
-                       
-                       if (data.success) {
-                           document.getElementById('edit-context-content').value = data.content;
-                       } else {
-                           alert(`❌ Error loading context: ${data.error}`);
-                       }
-                   } catch (error) {
-                       alert(`❌ Error: ${error.message}`);
-                   }
-               }
-           }
-       });
-       
-       async function saveContextChanges() {
-           const contextId = document.getElementById('edit-context-select').value;
-           const content = document.getElementById('edit-context-content').value;
-           
-           if (!contextId) {
-               alert('Please select a context to edit');
-               return;
-           }
-           
-           try {
-               const response = await fetch('/api/update_master_context', {
-                   method: 'POST',
-                   headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify({context_id: contextId, content: content})
-               });
-               
-               const result = await response.json();
-               if (result.success) {
-                   alert('✅ Context saved successfully!');
-                   loadMasterContextsList();
-               } else {
-                   alert(`❌ Error: ${result.error}`);
-               }
-           } catch (error) {
-               alert(`❌ Error saving context: ${error.message}`);
-           }
-       }
-       
-       async function deleteContext() {
-           const contextId = document.getElementById('edit-context-select').value;
-           if (!contextId) {
-               alert('Please select a context to delete');
-               return;
-           }
-           
-           if (!confirm(`Are you sure you want to delete context "${contextId}"?`)) return;
-           
-           try {
-               const response = await fetch(`/api/master_contexts/delete/${contextId}`, {
-                   method: 'DELETE'
-               });
-               
-               const result = await response.json();
-               if (result.success) {
-                   alert('✅ Context deleted successfully!');
-                   document.getElementById('edit-context-select').value = '';
-                   document.getElementById('edit-context-content').value = '';
-                   loadMasterContextsList();
-                   loadContextsForEdit();
-               } else {
-                   alert(`❌ Error: ${result.error}`);
-               }
-           } catch (error) {
-               alert(`❌ Error deleting context: ${error.message}`);
-           }
-       }
-       
-       // ===============================
-       // FILE SELECTION CONTROLS
-       // ===============================
        
        function selectAllFiles() {
            const fileItems = document.querySelectorAll('.file-item');
-           fileItems.forEach(item => {
-               if (!item.classList.contains('selected')) {
-                   item.click();
-               }
-           });
+           selectedFiles = [];
+           
+           // Get file IDs from allFiles global array if available
+           if (window.allFiles && window.allFiles.length > 0) {
+               window.allFiles.forEach(file => {
+                   const fileId = file.url || file.id;
+                   if (fileId) {
+                       selectedFiles.push(fileId);
+                   }
+               });
+           } else {
+               // Fallback: try to get from file list elements
+               fileItems.forEach(item => {
+                   // Look for vector ID in the content
+                   const vectorMatch = item.innerHTML.match(/\[([^\]]+)\]/);
+                   if (vectorMatch) {
+                       selectedFiles.push(vectorMatch[1]);
+                   }
+               });
+           }
+           
+           // Mark all file items as selected visually
+           fileItems.forEach(item => item.classList.add('selected'));
+           
            updateSelectionCount();
+           updateCurrentContext();
+           updateControls();
        }
        
        function deselectAllFiles() {
+           const fileItems = document.querySelectorAll('.file-item');
            selectedFiles = [];
-           document.querySelectorAll('.file-item.selected').forEach(item => {
-               item.classList.remove('selected');
-           });
+           fileItems.forEach(item => item.classList.remove('selected'));
            updateSelectionCount();
            updateCurrentContext();
-       }
-       
-       function invertSelection() {
-           const fileItems = document.querySelectorAll('.file-item');
-           fileItems.forEach(item => {
-               item.click();
-           });
-           updateSelectionCount();
-       }
-       
-       function selectHighRated() {
-           deselectAllFiles();
-           
-           // Load from extraction results and select 5-star files
-           loadExtractionResults().then(extractionFiles => {
-               if (extractionFiles) {
-                   extractionFiles.forEach(file => {
-                       if (file.rating === 5) {
-                           toggleFileSelection(file.url, null);
-                       }
-                   });
-                   updateSelectionCount();
-               }
-           });
+           updateControls();
        }
        
        function updateSelectionCount() {
-           const count = selectedFiles.length;
-           const countEl = document.getElementById('selection-count');
-           if (countEl) {
-               countEl.textContent = `${count} selected`;
+           const selected = selectedFiles.length;
+           const selectionInfo = document.getElementById('selection-info');
+           if (selectionInfo) {
+               selectionInfo.textContent = `${selected} files selected`;
            }
        }
        
-       async function deleteFileFromDatabase(fileUrl) {
-           if (!confirm(`Are you sure you want to delete this file from the database?\n\nURL: ${fileUrl}`)) {
-               return;
-           }
-           
+       async function viewContext(contextName) {
            try {
-               // Get file ID (hash of URL)
-               const fileId = `url_${await digestMessage(fileUrl)}`;
-               
-               const response = await fetch(`/api/database/${currentDatabase}/file/${fileId}`, {
-                   method: 'DELETE'
-               });
-               
-               const result = await response.json();
-               if (result.success) {
-                   alert('✅ File deleted from database!');
-                   // Refresh file list
-                   if (currentDatabase) {
-                       await loadFiles(currentDatabase);
-                   }
-               } else {
-                   alert(`❌ Error: ${result.error}`);
-               }
-           } catch (error) {
-               alert(`❌ Error deleting file: ${error.message}`);
-           }
-       }
-       
-       // Helper function to create MD5 hash
-       async function digestMessage(message) {
-           const msgUint8 = new TextEncoder().encode(message);
-           const hashBuffer = await crypto.subtle.digest('MD5', msgUint8);
-           const hashArray = Array.from(new Uint8Array(hashBuffer));
-           const hashHex = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
-           return hashHex;
-       }
-       
-       // ===============================
-       // NOTES MANAGEMENT
-       // ===============================
-       
-       async function saveQuickNotes() {
-           const content = document.getElementById('quick-notes').value.trim();
-           if (!content) {
-               alert('Please enter some notes first');
-               return;
-           }
-           
-           try {
-               const response = await fetch('/api/notes/quick', {
-                   method: 'POST',
-                   headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify({
-                       content: content,
-                       timestamp: new Date().toISOString()
-                   })
-               });
-               
-               const result = await response.json();
-               if (result.success) {
-                   document.getElementById('quick-notes').value = '';
-                   loadNotesList();
-                   alert('✅ Notes saved!');
-               } else {
-                   alert(`❌ Error: ${result.error}`);
-               }
-           } catch (error) {
-               alert(`❌ Error saving notes: ${error.message}`);
-           }
-       }
-       
-       async function loadNotesList() {
-           try {
-               const response = await fetch('/api/notes/list');
+               const response = await fetch('/api/master_contexts');
                const data = await response.json();
+               const context = data.contexts.find(c => c.name === contextName);
                
-               const notesList = document.getElementById('notes-list');
-               if (data.success && data.notes.length > 0) {
-                   notesList.innerHTML = data.notes.map(note => `
-                       <div class="note-item" style="background: #2a2a2a; border: 1px solid #333; margin-bottom: 5px; padding: 5px; border-radius: 2px;">
-                           <div style="font-size: 9px; color: #888; margin-bottom: 2px;">${note.timestamp}</div>
-                           <div style="font-size: 10px; color: #ccc;">${note.content}</div>
-                           <div style="margin-top: 3px;">
-                               <button class="btn" style="font-size: 8px; padding: 1px 4px;" onclick="editNote('${note.id}')">✏️</button>
-                               <button class="btn" style="font-size: 8px; padding: 1px 4px;" onclick="deleteNote('${note.id}')">🗑️</button>
-                           </div>
-                       </div>
-                   `).join('');
-               } else {
-                   notesList.innerHTML = '<div style="font-size: 10px; color: #666;">No notes yet</div>';
+               if (context) {
+                   const modal = window.open('', '_blank', 'width=800,height=600,scrollbars=yes');
+                   modal.document.write(`
+                       <html>
+                       <head><title>Master Context: ${context.name}</title></head>
+                       <body style="font-family: monospace; padding: 20px; background: #1e1e1e; color: #d4d4d4;">
+                           <h2 style="color: #00ff00;">📋 ${context.name}</h2>
+                           <p><strong>Size:</strong> ${context.size} characters</p>
+                           <hr style="border-color: #333;">
+                           <pre style="white-space: pre-wrap; font-size: 14px;">${context.content}</pre>
+                       </body>
+                       </html>
+                   `);
                }
            } catch (error) {
-               document.getElementById('notes-list').innerHTML = '<div style="color: red; font-size: 10px;">Error loading notes</div>';
+               alert('Error loading context: ' + error.message);
            }
        }
-       
-       function showNotesManager() {
-           // Create notes manager modal (similar to context manager)
-           const modal = document.createElement('div');
-           modal.className = 'notes-manager-modal';
-           modal.innerHTML = `
-               <div class="notes-manager-content" style="background: #1a1a1a; border: 1px solid #333; border-radius: 8px; width: 70%; max-width: 800px; height: 70%; display: flex; flex-direction: column;">
-                   <div class="notes-manager-header" style="padding: 15px; background: #2a2a2a; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; font-weight: bold; color: #00ff00;">
-                       <span>📝 Notes Manager</span>
-                       <button class="btn" onclick="closeNotesManager()">❌ Close</button>
-                   </div>
-                   <div class="notes-manager-body" style="flex: 1; padding: 15px; overflow-y: auto;">
-                       <div style="margin-bottom: 15px;">
-                           <label>New Note:</label>
-                           <textarea id="new-note-content" rows="5" style="width: 100%; background: #333; color: #00ff00; border: 1px solid #555; padding: 8px; font-family: inherit; font-size: 12px;" placeholder="Enter your note..."></textarea>
-                           <button class="btn primary" style="margin-top: 5px;" onclick="createNewNote()">💾 Save Note</button>
-                       </div>
-                       <div id="all-notes-list">Loading notes...</div>
-                   </div>
-               </div>
-           `;
-           
-           // Add modal styles
-           modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; justify-content: center; align-items: center;';
-           
-           document.body.appendChild(modal);
-           loadAllNotes();
-       }
-       
-       function closeNotesManager() {
-           const modal = document.querySelector('.notes-manager-modal');
-           if (modal) modal.remove();
-       }
-       
-       async function createNewNote() {
-           const content = document.getElementById('new-note-content').value.trim();
-           if (!content) {
-               alert('Please enter note content');
-               return;
-           }
-           
-           try {
-               const response = await fetch('/api/notes/create', {
-                   method: 'POST',
-                   headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify({content: content})
-               });
-               
-               const result = await response.json();
-               if (result.success) {
-                   document.getElementById('new-note-content').value = '';
-                   loadAllNotes();
-                   loadNotesList(); // Refresh sidebar notes
-                   alert('✅ Note created!');
-               } else {
-                   alert(`❌ Error: ${result.error}`);
-               }
-           } catch (error) {
-               alert(`❌ Error: ${error.message}`);
-           }
-       }
-       
-       async function loadAllNotes() {
-           try {
-               const response = await fetch('/api/notes/list');
-               const data = await response.json();
-               
-               const notesList = document.getElementById('all-notes-list');
-               if (data.success && data.notes.length > 0) {
-                   notesList.innerHTML = data.notes.map(note => `
-                       <div class="note-item" style="background: #2a2a2a; border: 1px solid #333; margin-bottom: 10px; padding: 10px; border-radius: 4px;">
-                           <div style="font-size: 10px; color: #888; margin-bottom: 5px;">${note.timestamp}</div>
-                           <div style="font-size: 12px; color: #ccc; white-space: pre-wrap;">${note.content}</div>
-                           <div style="margin-top: 10px; display: flex; gap: 5px;">
-                               <button class="btn" onclick="editNote('${note.id}')">✏️ Edit</button>
-                               <button class="btn warning" onclick="deleteNote('${note.id}')">🗑️ Delete</button>
-                           </div>
-                       </div>
-                   `).join('');
-               } else {
-                   notesList.innerHTML = '<div style="color: #666;">No notes yet</div>';
-               }
-           } catch (error) {
-               document.getElementById('all-notes-list').innerHTML = '<div style="color: red;">Error loading notes</div>';
-           }
-       }
-       
-       async function deleteNote(noteId) {
-           if (!confirm('Are you sure you want to delete this note?')) return;
-           
-           try {
-               const response = await fetch(`/api/notes/delete/${noteId}`, {
-                   method: 'DELETE'
-               });
-               
-               const result = await response.json();
-               if (result.success) {
-                   loadAllNotes();
-                   loadNotesList();
-                   alert('✅ Note deleted!');
-               } else {
-                   alert(`❌ Error: ${result.error}`);
-               }
-           } catch (error) {
-               alert(`❌ Error: ${error.message}`);
-           }
-       }
-       
-       // Load notes on page load
-       document.addEventListener('DOMContentLoaded', function() {
-           loadNotesList();
-       });
-       
-       // ===============================
-       // FUNCTION CALL RESULTS DISPLAY
-       // ===============================
-       
-       function displayFunctionResults(functionCalls) {
-           const messagesContainer = document.getElementById('chat-messages');
-           
-           functionCalls.forEach(call => {
-               if (call.function === 'search_documents' && call.result.success) {
-                   const results = call.result.results || [];
-                   
-                   if (results.length > 0) {
-                       const resultsDiv = document.createElement('div');
-                       resultsDiv.className = 'message system';
-                       resultsDiv.innerHTML = `
-                           <div class="message-role">📋 Search Results (${results.length} documents found)</div>
-                           <div class="message-content">
-                               <div class="function-results">
-                                   ${results.map((doc, index) => `
-                                       <div class="result-item" style="background: #2a2a2a; border: 1px solid #333; margin: 8px 0; padding: 10px; border-radius: 4px;">
-                                           <div style="display: flex; justify-content: space-between; align-items: flex-start;">
-                                               <div style="flex: 1;">
-                                                   <div style="font-weight: bold; color: #00ff00; margin-bottom: 5px;">${doc.title}</div>
-                                                   <div style="font-size: 10px; color: #888; margin-bottom: 5px;">
-                                                       Rating: ${doc.rating}⭐ | Length: ${doc.content_length.toLocaleString()} chars
-                                                   </div>
-                                                   <div style="font-size: 11px; color: #ccc; margin-bottom: 8px;">
-                                                       ${doc.content_preview}
-                                                   </div>
-                                                   <div style="font-size: 9px; color: #666;">
-                                                       URL: ${doc.url}
-                                                   </div>
-                                               </div>
-                                               <div style="display: flex; flex-direction: column; gap: 4px; margin-left: 10px;">
-                                                   ${doc.markdown_file ? `
-                                                       <button class="btn" style="font-size: 8px; padding: 3px 6px;" 
-                                                               onclick="viewMarkdownFromResult('${doc.markdown_file}', '${doc.title}')">
-                                                           👁️ View
-                                                       </button>
-                                                       <button class="btn" style="font-size: 8px; padding: 3px 6px;" 
-                                                               onclick="editMarkdownFromResult('${doc.markdown_file}', '${doc.title}', '${doc.url}')">
-                                                           ✏️ Edit
-                                                       </button>
-                                                   ` : ''}
-                                                   <button class="btn" style="font-size: 8px; padding: 3px 6px;" 
-                                                           onclick="getFullDocument('${doc.url}')">
-                                                       📄 Full
-                                                   </button>
-                                               </div>
-                                           </div>
-                                       </div>
-                                   `).join('')}
-                               </div>
-                           </div>
-                       `;
-                       
-                       messagesContainer.appendChild(resultsDiv);
-                       messagesContainer.scrollTop = messagesContainer.scrollHeight;
-                   }
-               }
-           });
-       }
-       
-       function viewMarkdownFromResult(markdownPath, title) {
-           // Open markdown file in popup
-           const url = `/api/view_markdown?file_path=${encodeURIComponent(markdownPath)}`;
-           const popup = window.open(url, '_blank', 'width=1000,height=800,scrollbars=yes,resizable=yes');
-           if (popup) {
-               popup.document.title = `Markdown Viewer - ${title}`;
-           }
-       }
-       
-       function editMarkdownFromResult(markdownPath, title, originalUrl) {
-           // Create edit modal for markdown content
-           openMarkdownEditor(markdownPath, title, originalUrl);
-       }
-       
-       async function openMarkdownEditor(markdownPath, title, originalUrl) {
-           try {
-               // Load current content
-               const response = await fetch(`/api/load_markdown_content?file_path=${encodeURIComponent(markdownPath)}`);
-               const data = await response.json();
-               
-               if (!data.success) {
-                   alert(`Error loading file: ${data.error}`);
-                   return;
-               }
-               
-               // Create editor modal
-               const modal = document.createElement('div');
-               modal.className = 'markdown-editor-modal';
-               modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; justify-content: center; align-items: center;';
-               
-               modal.innerHTML = `
-                   <div class="markdown-editor-content" style="background: #1a1a1a; border: 1px solid #333; border-radius: 8px; width: 90%; height: 90%; display: flex; flex-direction: column;">
-                       <div class="markdown-editor-header" style="padding: 15px; background: #2a2a2a; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; font-weight: bold; color: #00ff00;">
-                           <span>✏️ Edit Document: ${title}</span>
-                           <div>
-                               <button class="btn primary" onclick="saveMarkdownContent('${markdownPath}', '${originalUrl}')">💾 Save</button>
-                               <button class="btn" onclick="closeMarkdownEditor()">❌ Close</button>
-                           </div>
-                       </div>
-                       <div class="markdown-editor-body" style="flex: 1; padding: 15px; overflow: hidden;">
-                           <div style="margin-bottom: 10px; font-size: 10px; color: #888;">
-                               File: ${markdownPath}
-                           </div>
-                           <textarea id="markdown-content-editor" style="width: 100%; height: calc(100% - 30px); background: #333; color: #00ff00; border: 1px solid #555; padding: 10px; font-family: monospace; font-size: 12px; resize: none;">${data.content}</textarea>
-                       </div>
-                   </div>
-               `;
-               
-               document.body.appendChild(modal);
-               
-           } catch (error) {
-               alert(`Error opening editor: ${error.message}`);
-           }
-       }
-       
-       function closeMarkdownEditor() {
-           const modal = document.querySelector('.markdown-editor-modal');
-           if (modal) modal.remove();
-       }
-       
-       async function saveMarkdownContent(markdownPath, originalUrl) {
-           const content = document.getElementById('markdown-content-editor').value;
-           
-           try {
-               const response = await fetch('/api/save_markdown_content', {
-                   method: 'POST',
-                   headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify({
-                       file_path: markdownPath,
-                       content: content,
-                       url: originalUrl
-                   })
-               });
-               
-               const result = await response.json();
-               if (result.success) {
-                   alert('✅ Markdown file saved successfully!');
-                   closeMarkdownEditor();
-               } else {
-                   alert(`❌ Error saving: ${result.error}`);
-               }
-           } catch (error) {
-               alert(`❌ Error: ${error.message}`);
-           }
-       }
-       
-       async function getFullDocument(url) {
-           try {
-               // Use MCP to get full document content
-               const response = await fetch('/api/mcp_get_document', {
-                   method: 'POST',
-                   headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify({document_id: url})
-               });
-               
-               const data = await response.json();
-               if (data.success) {
-                   // Display full content in a modal
-                   showFullDocumentModal(data.document);
-               } else {
-                   alert(`Error getting full document: ${data.error}`);
-               }
-           } catch (error) {
-               alert(`Error: ${error.message}`);
-           }
-       }
-       
-       function showFullDocumentModal(document) {
-           const modal = document.createElement('div');
-           modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; justify-content: center; align-items: center;';
-           
-           modal.innerHTML = `
-               <div style="background: #1a1a1a; border: 1px solid #333; border-radius: 8px; width: 80%; height: 80%; display: flex; flex-direction: column;">
-                   <div style="padding: 15px; background: #2a2a2a; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; font-weight: bold; color: #00ff00;">
-                       <span>📄 ${document.title}</span>
-                       <button class="btn" onclick="this.closest('div').parentElement.parentElement.remove()">❌ Close</button>
-                   </div>
-                   <div style="flex: 1; padding: 15px; overflow-y: auto;">
-                       <div style="font-size: 10px; color: #888; margin-bottom: 10px;">
-                           Rating: ${document.rating}⭐ | Length: ${document.content_length} chars
-                       </div>
-                       <div style="white-space: pre-wrap; font-size: 12px; color: #ccc; line-height: 1.4;">
-                           ${document.full_content}
-                       </div>
-                   </div>
-               </div>
-           `;
-           
-           document.body.appendChild(modal);
-       }
-       
-       // ===============================
-       // LLM RESPONSE MANAGEMENT
-       // ===============================
        
        async function saveResponseToMCP(content) {
-           const title = prompt('Enter title for this analysis:');
-           if (!title) return;
-           
            try {
                const response = await fetch('/api/save_response_to_mcp', {
                    method: 'POST',
                    headers: {'Content-Type': 'application/json'},
                    body: JSON.stringify({
-                       title: title,
                        content: content,
+                       database: currentDatabase,
                        timestamp: new Date().toISOString()
                    })
                });
                
-               const result = await response.json();
-               if (result.success) {
-                   alert('✅ Response saved to MCP database!');
-                   // Refresh MCP file list if in MCP mode
-                   if (currentDatabase && document.querySelector('input[name="explorer-mode"]:checked').value === 'mcp') {
-                       await loadFiles(currentDatabase);
-                   }
-               } else {
-                   alert(`❌ Error: ${result.error}`);
-               }
-           } catch (error) {
-               alert(`❌ Error: ${error.message}`);
-           }
-       }
-       
-       async function viewRawLogs(sessionId) {
-           if (!sessionId) {
-               alert('No session ID available. Please send a message first.');
-               return;
-           }
-           
-           try {
-               const response = await fetch(`/api/view_session_logs/${sessionId}`);
                const data = await response.json();
-               
-               if (!data.success) {
-                   alert(`Error loading logs: ${data.error}`);
-                   return;
-               }
-               
-               const modal = document.createElement('div');
-               modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; justify-content: center; align-items: center;';
-               
-               const logEntries = data.entries.map(entry => {
-                   const timestamp = new Date(entry.timestamp).toLocaleString();
-                   const entryData = JSON.stringify(entry.data, null, 2);
-                   
-                   return `
-                       <div style="border: 1px solid #333; margin-bottom: 10px; border-radius: 4px; background: #2a2a2a;">
-                           <div style="padding: 8px; background: #333; font-weight: bold; color: #00ff00;">
-                               [${entry.type}] ${timestamp}
-                           </div>
-                           <div style="padding: 10px; max-height: 300px; overflow-y: auto;">
-                               <pre style="font-size: 10px; color: #ccc; white-space: pre-wrap; margin: 0;">${entryData}</pre>
-                           </div>
-                       </div>
-                   `;
-               }).join('');
-               
-               modal.innerHTML = `
-                   <div style="background: #1a1a1a; border: 1px solid #333; border-radius: 8px; width: 90%; height: 90%; display: flex; flex-direction: column;">
-                       <div style="padding: 15px; background: #2a2a2a; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center;">
-                           <span style="font-weight: bold; color: #00ff00;">🔍 Raw LLM Logs - Session: ${sessionId.substring(0, 16)}...</span>
-                           <div>
-                               <button class="btn" onclick="downloadLogs('${sessionId}')" style="margin-right: 10px;">💾 Download</button>
-                               <button class="btn" onclick="this.closest('div').parentElement.parentElement.remove()">❌ Close</button>
-                           </div>
-                       </div>
-                       <div style="flex: 1; padding: 15px; overflow-y: auto;">
-                           <div style="font-size: 12px; color: #888; margin-bottom: 15px;">
-                               Total entries: ${data.total_entries} | Session: ${sessionId}
-                           </div>
-                           ${logEntries || '<div style="color: #666;">No log entries found for this session.</div>'}
-                       </div>
-                   </div>
-               `;
-               
-               document.body.appendChild(modal);
-               
-           } catch (error) {
-               alert(`Error loading logs: ${error.message}`);
-           }
-       }
-       
-       async function downloadLogs(sessionId) {
-           try {
-               const response = await fetch(`/api/view_session_logs/${sessionId}`);
-               const data = await response.json();
-               
                if (data.success) {
-                   const logContent = JSON.stringify(data.entries, null, 2);
-                   const blob = new Blob([logContent], { type: 'application/json' });
-                   const url = window.URL.createObjectURL(blob);
+                   console.log('Save response data:', data);
+                   console.log('Selected files:', selectedFiles);
+                   console.log('Processed files:', processedFiles);
                    
-                   const a = document.createElement('a');
-                   a.href = url;
-                   a.download = `llm_logs_${sessionId.substring(0, 16)}_${new Date().toISOString().slice(0, 10)}.json`;
-                   document.body.appendChild(a);
-                   a.click();
-                   window.URL.revokeObjectURL(url);
-                   document.body.removeChild(a);
+                   alert('✅ Response saved to MCP database!');
                    
-                   alert('✅ Logs downloaded successfully!');
+                   // Mark all currently processed files as saved and add nested info
+                   selectedFiles.forEach(fileId => {
+                       console.log(`Checking file ${fileId}, is processed:`, processedFiles.has(fileId));
+                       if (processedFiles.has(fileId)) {
+                           markFileAsSaved(fileId);
+                           addNestedResponseInfo(fileId, data.vector_id, data.markdown_file);
+                       }
+                   });
+                   
+                   if (currentDatabase) await refreshFiles();
+               } else {
+                   alert('❌ Save error: ' + data.error);
                }
            } catch (error) {
-               alert(`Error downloading logs: ${error.message}`);
+               alert('❌ Save error: ' + error.message);
            }
        }
        
-       function editResponse(contentDiv, originalContent) {
-           // Replace content div with textarea for editing
+       function editResponse(contentDiv, content) {
            const textarea = document.createElement('textarea');
-           textarea.value = originalContent;
-           textarea.style.cssText = 'width: 100%; height: 200px; background: #333; color: #00ff00; border: 1px solid #555; padding: 8px; font-family: inherit; font-size: 12px;';
+           textarea.value = content;
+           textarea.style.cssText = 'width: 100%; height: 200px; background: #2a2a2a; color: #d4d4d4; border: 1px solid #333; padding: 10px; font-family: monospace;';
            
            const saveBtn = document.createElement('button');
-           saveBtn.textContent = '💾 Save Changes';
-           saveBtn.className = 'btn primary';
-           saveBtn.style.marginTop = '5px';
+           saveBtn.textContent = 'Save Changes';
+           saveBtn.className = 'btn';
            saveBtn.onclick = () => {
                contentDiv.textContent = textarea.value;
-               contentDiv.parentNode.replaceChild(contentDiv, textarea);
+               contentDiv.style.display = 'block';
+               textarea.remove();
                saveBtn.remove();
+               cancelBtn.remove();
            };
            
-           contentDiv.parentNode.replaceChild(textarea, contentDiv);
-           textarea.parentNode.insertBefore(saveBtn, textarea.nextSibling);
+           const cancelBtn = document.createElement('button');
+           cancelBtn.textContent = 'Cancel';
+           cancelBtn.className = 'btn';
+           cancelBtn.onclick = () => {
+               contentDiv.style.display = 'block';
+               textarea.remove();
+               saveBtn.remove();
+               cancelBtn.remove();
+           };
+           
+           contentDiv.style.display = 'none';
+           contentDiv.parentNode.insertBefore(textarea, contentDiv.nextSibling);
+           contentDiv.parentNode.insertBefore(saveBtn, textarea.nextSibling);
+           contentDiv.parentNode.insertBefore(cancelBtn, saveBtn.nextSibling);
        }
        
        function viewFullResponse(content) {
-           const modal = document.createElement('div');
-           modal.style.cssText = 'position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000; display: flex; justify-content: center; align-items: center;';
-           
-           modal.innerHTML = `
-               <div style="background: #1a1a1a; border: 1px solid #333; border-radius: 8px; width: 80%; height: 80%; display: flex; flex-direction: column;">
-                   <div style="padding: 15px; background: #2a2a2a; border-bottom: 1px solid #333; display: flex; justify-content: space-between; align-items: center; font-weight: bold; color: #00ff00;">
-                       <span>📄 LLM Response</span>
-                       <button class="btn" onclick="this.closest('div').parentElement.parentElement.remove()">❌ Close</button>
-                   </div>
-                   <div style="flex: 1; padding: 15px; overflow-y: auto;">
-                       <div style="white-space: pre-wrap; font-size: 12px; color: #ccc; line-height: 1.4;">
-                           ${content}
-                       </div>
-                   </div>
-               </div>
-           `;
-           
-           document.body.appendChild(modal);
+           const modal = window.open('', '_blank', 'width=1000,height=700,scrollbars=yes');
+           modal.document.write(`
+               <html>
+               <head><title>Full Response</title></head>
+               <body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; padding: 20px; background: #1e1e1e; color: #d4d4d4; line-height: 1.6;">
+                   <h2 style="color: #00ff00;">🤖 Full LLM Response</h2>
+                   <hr style="border-color: #333;">
+                   <pre style="white-space: pre-wrap; font-size: 14px; background: #2a2a2a; padding: 20px; border-radius: 5px; border: 1px solid #333;">${content}</pre>
+               </body>
+               </html>
+           `);
        }
        
-       // ===============================
-       // DUAL FILE EXPLORER MODES
-       // ===============================
-       
-       let currentExplorerMode = 'mcp';
-       let pcFiles = [];
-       let selectedPCFiles = [];
-       
-       function switchExplorerMode(mode) {
-           currentExplorerMode = mode;
-           
-           if (mode === 'mcp') {
-               document.getElementById('mcp-mode-controls').style.display = 'flex';
-               document.getElementById('pc-mode-controls').style.display = 'none';
-               document.getElementById('file-selection-controls').style.display = 'block';
-               
-               // Load MCP files
-               if (currentDatabase) {
-                   loadFiles(currentDatabase);
-               } else {
-                   document.getElementById('file-list').innerHTML = 'Select a database first';
-               }
-           } else {
-               document.getElementById('mcp-mode-controls').style.display = 'none';
-               document.getElementById('pc-mode-controls').style.display = 'flex';
-               document.getElementById('file-selection-controls').style.display = 'none';
-               
-               // Load PC file browser
-               loadPCFiles();
+       function viewRawLogs(sessionId) {
+           if (!sessionId) {
+               alert('No session ID available');
+               return;
            }
+           window.open(`/api/view_session_logs/${sessionId}`, '_blank');
        }
        
-       async function browsePCFiles() {
-           try {
-               const response = await fetch('/api/browse_pc_files', {
-                   method: 'POST',
-                   headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify({path: '/home/flintx/remember'})
-               });
-               
-               const data = await response.json();
-               if (data.success) {
-                   pcFiles = data.files;
-                   renderPCFiles();
-               } else {
-                   alert(`Error: ${data.error}`);
+       function markFileAsProcessed(fileId) {
+           console.log('Marking file as processed:', fileId);
+           const fileItems = document.querySelectorAll('.file-item');
+           let found = false;
+           fileItems.forEach(item => {
+               // Check if this file item corresponds to the processed file
+               const vectorMatch = item.innerHTML.match(/\[([^\]]+)\]/);
+               if (vectorMatch && vectorMatch[1] === fileId) {
+                   found = true;
+                   console.log('Found matching file item for:', fileId);
+                   item.classList.add('processed');
+                   // Add status indicator if not already present
+                   if (!item.querySelector('.file-status')) {
+                       const statusDiv = document.createElement('div');
+                       statusDiv.className = 'file-status status-processed';
+                       statusDiv.textContent = '🔄 Processed';
+                       item.appendChild(statusDiv);
+                       console.log('Added processed status to:', fileId);
+                   }
                }
-           } catch (error) {
-               alert(`Error: ${error.message}`);
-           }
-       }
-       
-       function loadPCFiles() {
-           document.getElementById('file-list').innerHTML = `
-               <div style="text-align: center; padding: 20px; color: #888;">
-                   <div style="margin-bottom: 10px;">💻 PC File Explorer Mode</div>
-                   <div style="font-size: 10px;">Click "📂 Browse Files" to explore your file system</div>
-               </div>
-           `;
-       }
-       
-       function renderPCFiles() {
-           const fileList = document.getElementById('file-list');
-           fileList.innerHTML = '';
-           
-           pcFiles.forEach(file => {
-               const fileDiv = document.createElement('div');
-               fileDiv.className = 'file-item';
-               fileDiv.style.cursor = 'pointer';
-               
-               const isSelected = selectedPCFiles.includes(file.path);
-               if (isSelected) fileDiv.classList.add('selected');
-               
-               fileDiv.onclick = () => togglePCFileSelection(file.path, fileDiv);
-               
-               fileDiv.innerHTML = `
-                   <div class="file-name">${file.name}</div>
-                   <div class="file-meta">
-                       <span>${file.type}</span>
-                       <span>${file.size}</span>
-                   </div>
-                   <div class="file-meta">
-                       <span style="font-size: 8px; color: #666;">${file.path}</span>
-                   </div>
-               `;
-               
-               fileList.appendChild(fileDiv);
            });
-           
-           updateAddToMCPButton();
-       }
-       
-       function togglePCFileSelection(filePath, element) {
-           if (selectedPCFiles.includes(filePath)) {
-               selectedPCFiles = selectedPCFiles.filter(path => path !== filePath);
-               element.classList.remove('selected');
-           } else {
-               selectedPCFiles.push(filePath);
-               element.classList.add('selected');
+           if (!found) {
+               console.log('No matching file item found for:', fileId);
            }
-           updateAddToMCPButton();
        }
        
-       function updateAddToMCPButton() {
-           const btn = document.getElementById('add-to-mcp-btn');
-           btn.disabled = selectedPCFiles.length === 0;
-           btn.textContent = `➕ Add ${selectedPCFiles.length} to MCP`;
-       }
-       
-       async function addSelectedToMCP() {
-           if (selectedPCFiles.length === 0) return;
-           
-           try {
-               const response = await fetch('/api/add_files_to_mcp', {
-                   method: 'POST',
-                   headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify({
-                       files: selectedPCFiles,
-                       database: currentDatabase
-                   })
-               });
-               
-               const result = await response.json();
-               if (result.success) {
-                   alert(`✅ ${result.files_added} files added to MCP database!`);
-                   selectedPCFiles = [];
-                   renderPCFiles();
-               } else {
-                   alert(`❌ Error: ${result.error}`);
+       function markFileAsSaved(fileId) {
+           const fileItems = document.querySelectorAll('.file-item');
+           fileItems.forEach(item => {
+               const vectorMatch = item.innerHTML.match(/\[([^\]]+)\]/);
+               if (vectorMatch && vectorMatch[1] === fileId) {
+                   item.classList.remove('processed');
+                   item.classList.add('saved');
+                   savedFiles.add(fileId);
+                   
+                   // Update status indicator
+                   const existingStatus = item.querySelector('.file-status');
+                   if (existingStatus) {
+                       existingStatus.className = 'file-status status-saved';
+                       existingStatus.textContent = '✅ Saved';
+                   } else {
+                       const statusDiv = document.createElement('div');
+                       statusDiv.className = 'file-status status-saved';
+                       statusDiv.textContent = '✅ Saved';
+                       item.appendChild(statusDiv);
+                   }
                }
-           } catch (error) {
-               alert(`❌ Error: ${error.message}`);
-           }
+           });
        }
        
-       async function addFolderToMCP() {
-           const folderPath = prompt('Enter folder path to add to MCP:');
-           if (!folderPath) return;
-           
-           try {
-               const response = await fetch('/api/add_folder_to_mcp', {
-                   method: 'POST',
-                   headers: {'Content-Type': 'application/json'},
-                   body: JSON.stringify({
-                       folder_path: folderPath,
-                       database: currentDatabase
-                   })
-               });
-               
-               const result = await response.json();
-               if (result.success) {
-                   alert(`✅ ${result.files_added} files added from folder to MCP!`);
-               } else {
-                   alert(`❌ Error: ${result.error}`);
+       function maintainFileSelection() {
+           // Re-apply selection highlighting for currently selected files
+           const fileItems = document.querySelectorAll('.file-item');
+           fileItems.forEach(item => {
+               const vectorMatch = item.innerHTML.match(/\[([^\]]+)\]/);
+               if (vectorMatch && selectedFiles.includes(vectorMatch[1])) {
+                   item.classList.add('selected');
                }
-           } catch (error) {
-               alert(`❌ Error: ${error.message}`);
-           }
+           });
        }
        
+       function addNestedResponseInfo(fileId, vectorId, markdownFile) {
+           console.log('Adding nested response info for:', fileId, vectorId, markdownFile);
+           // Store the info persistently
+           fileResponseInfo.set(fileId, { vectorId, markdownFile });
+           
+           const fileItems = document.querySelectorAll('.file-item');
+           let found = false;
+           fileItems.forEach(item => {
+               const vectorMatch = item.innerHTML.match(/\[([^\]]+)\]/);
+               if (vectorMatch && vectorMatch[1] === fileId) {
+                   found = true;
+                   console.log('Adding response info to file item:', fileId);
+                   
+                   // Remove existing response info if any
+                   const existingInfo = item.querySelector('.response-info');
+                   if (existingInfo) {
+                       existingInfo.remove();
+                   }
+                   
+                   // Create new response info
+                   const responseInfo = document.createElement('div');
+                   responseInfo.className = 'response-info';
+                   responseInfo.innerHTML = `
+                       <strong>📄 Saved Response:</strong><br>
+                       🆔 Vector ID: <code>${vectorId}</code><br>
+                       📋 <a href="/api/view_markdown?file_path=${encodeURIComponent(markdownFile)}" target="_blank">View Markdown File</a>
+                   `;
+                   
+                   item.appendChild(responseInfo);
+                   console.log('Response info added successfully');
+               }
+           });
+           if (!found) {
+               console.log('No matching file item found for response info:', fileId);
+           }
+       }
    </script>
 </body>
 </html>""")
 
-# EXTRACTION BACKEND ENDPOINTS
-
-PROXY_ORDER = [
-   ("Local", None),
-   ("Mobile", "http://52fb2fcd77ccbf54b65c:5a02792bf800a049@gw.dataimpulse.com:823"),
-   ("Residential", "http://0aa180faa467ad67809b__cr.us:6dc612d4a08ca89d@gw.dataimpulse.com:823")
-]
-
-USER_AGENTS = [
-   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-]
-
-@app.post("/api/start_extraction")
-async def start_extraction(background_tasks: BackgroundTasks):
-   """Start URL extraction process"""
-   global extraction_progress
-   
-   if extraction_progress["active"]:
-       return {"success": False, "error": "Extraction already in progress"}
-   
-   # Load URLs from urls.txt
-   urls_file = Path.home() / "remember" / "urls.txt"
-   if not urls_file.exists():
-       return {"success": False, "error": "urls.txt not found"}
-   
-   try:
-       with open(urls_file, 'r') as f:
-           urls = [line.strip() for line in f if line.strip() and not line.startswith('#')]
-       
-       if not urls:
-           return {"success": False, "error": "No URLs found in urls.txt"}
-       
-       # Reset progress
-       extraction_progress.update({
-           "active": True,
-           "total_urls": len(urls),
-           "current_index": 0,
-           "current_url": "",
-           "success_count": 0,
-           "failed_count": 0,
-           "total_chars": 0,
-           "start_time": datetime.now(),
-           "status": "processing",
-           "results": []
-       })
-       
-       # Start extraction in background
-       background_tasks.add_task(run_extraction, urls)
-       
-       return {"success": True, "total_urls": len(urls)}
-       
-   except Exception as e:
-       return {"success": False, "error": str(e)}
-
-@app.get("/api/extraction_progress")
-async def get_extraction_progress():
-   """Get current extraction progress"""
-   global extraction_progress
-   
-   progress_data = extraction_progress.copy()
-   if progress_data["start_time"]:
-       progress_data["start_time"] = progress_data["start_time"].isoformat()
-   
-   return progress_data
-
-@app.post("/api/cancel_extraction")
-async def cancel_extraction():
-   """Cancel extraction process"""
-   global extraction_progress
-   extraction_progress["active"] = False
-   extraction_progress["status"] = "cancelled"
-   return {"success": True}
-
-async def run_extraction(urls: List[str]):
-    """Run the actual extraction process with proper progress updates"""
-    global extraction_progress
-    
-    remember_dir = Path.home() / "remember"
-    content_dir = remember_dir / "scraped_content"
-    content_dir.mkdir(exist_ok=True, parents=True)
-    
-    all_results = []
-    
-    for i, url in enumerate(urls):
-        if not extraction_progress["active"]:
-            break
-        
-        # Update progress BEFORE processing
-        extraction_progress.update({
-            "current_index": i + 1,
-            "current_url": url
-        })
-        
-        # Add small delay for UI updates
-        await asyncio.sleep(0.1)
-        
-        success = False
-        
-        for attempt, (proxy_name, proxy_url) in enumerate(PROXY_ORDER):
-            try:
-                session = requests.Session()
-                session.headers.update({"User-Agent": random.choice(USER_AGENTS)})
-                if proxy_url:
-                    session.proxies = {"http": proxy_url, "https": proxy_url}
-                
-                response = session.get(url, timeout=30, stream=True)
-                response.raise_for_status()
-                
-                content_type = response.headers.get("Content-Type", "").lower()
-                
-                if "application/pdf" in content_type:
-                    pdf_bytes = response.content
-                    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-                    pdf_text = "".join(page.get_text() for page in doc)
-                    doc.close()
-                    
-                    title = f"[PDF] {Path(url).name}"
-                    best_content = pdf_text
-                else:
-                    clean_content = response.text.replace("\x00", "")
-                    doc = Document(clean_content)
-                    title = doc.title()
-                    best_content = BeautifulSoup(doc.summary(), "html.parser").get_text(separator="\n", strip=True)
-                    
-                    if not best_content or len(best_content) < 100:
-                        soup = BeautifulSoup(clean_content, "html.parser")
-                        for tag in soup(["script", "style", "nav", "header", "footer", "aside", "form"]):
-                            tag.decompose()
-                        best_content = soup.get_text(separator="\n", strip=True)
-                
-                md_filename = clean_filename(url, "md")
-                md_filepath = content_dir / md_filename
-                
-                with open(md_filepath, "w", encoding="utf-8") as f:
-                    f.write(f"# {title}\n\n_Source: {url}_\n\n---\n\n{best_content}")
-                
-                rating = calculate_rating(len(best_content))
-                
-                result = {
-                    "url": url,
-                    "title": title,
-                    "rating": rating,
-                    "markdown_file": str(md_filepath),
-                    "content": best_content
-                }
-                
-                all_results.append(result)
-                extraction_progress["success_count"] += 1
-                extraction_progress["total_chars"] += len(best_content)
-                
-                success = True
-                break
-                
-            except Exception as e:
-                continue
-        
-        if not success:
-            extraction_progress["failed_count"] += 1
-    
-    # Save results and auto-import
-    if all_results:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        results_file = remember_dir / f"extraction_results_{timestamp}.json"
-        
-        with open(results_file, "w", encoding="utf-8") as f:
-            json.dump(all_results, f, indent=2)
-        
-        try:
-            import_result = import_extraction_session(str(results_file))
-            extraction_progress["import_result"] = import_result
-        except Exception as e:
-            extraction_progress["import_error"] = str(e)
-    
-    extraction_progress["active"] = False
-    extraction_progress["status"] = "completed"
-
-def clean_filename(url: str, extension: str) -> str:
-    """Clean URL for filename"""
-    clean = re.sub(r'^https?:\/\/', '', url).replace('/', '_')
-    clean = re.sub(r'[\\?%*:|"<>]', '', clean)
-    return f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{clean[:70]}.{extension}"
-
-def calculate_rating(length: int) -> int:
-    """Calculate content rating"""
-    if length > 8000: return 5
-    if length > 4000: return 4
-    if length > 1500: return 3
-    if length > 500: return 2
-
-
-@app.get("/api/databases")
-async def get_databases():
-    """Get all available ChromaDB databases"""
-    try:
-        databases = []
-        
-        # Default remember database
-        try:
-            client = get_client()
-            collections = client.list_collections()
-            
-            total_docs = 0
-            for collection in collections:
-                collection_data = client.get_collection(collection.name)
-                count = collection_data.count()
-                total_docs += count
-            
-            databases.append({
-                "name": "remember_db",
-                "path": str(Path.home() / "remember_db"),
-                "collections": len(collections),
-                "documents": total_docs,
-                "type": "primary"
-            })
-        except Exception as e:
-            print(f"⚠️ Could not access remember_db: {e}")
-        
-        return {"databases": databases}
-        
-    except Exception as e:
-        return {"databases": [], "error": str(e)}
-
-@app.get("/api/database/{database_name}/files")
-async def get_database_files(database_name: str):
-    """Get files from specific database"""
-    try:
-        if database_name == "remember_db":
-            client = get_client()
-        else:
-            db_path = Path.home() / database_name
-            client = chromadb.PersistentClient(path=str(db_path))
-        
-        collections = client.list_collections()
-        files = []
-        
-        for collection in collections:
-            collection_data = client.get_collection(collection.name)
-            data = collection_data.get(include=["metadatas"])
-            
-            if data["ids"]:
-                for i, doc_id in enumerate(data["ids"]):
-                    metadata = data["metadatas"][i] if data["metadatas"] else {}
-                    
-                    files.append({
-                        "id": doc_id,
-                        "collection": collection.name,
-                        "title": metadata.get("title", doc_id),
-                        "type": metadata.get("type", "document"),
-                        "size": len(str(metadata)),
-                        "created": metadata.get("created", "unknown"),
-                        "rating": metadata.get("rating", 0)
-                    })
-        
-        return {"files": files}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
-
-@app.get("/api/extraction_results")
-async def get_extraction_results():
-    """Get the latest extraction results JSON"""
-    try:
-        remember_dir = Path.home() / "remember"
-        
-        # Find the most recent extraction results file
-        pattern = remember_dir / "extraction_results_*.json"
-        json_files = list(remember_dir.glob("extraction_results_*.json"))
-        
-        if not json_files:
-            return {"results": []}
-        
-        # Sort by modification time and get the latest
-        latest_file = max(json_files, key=lambda f: f.stat().st_mtime)
-        
-        with open(latest_file, 'r', encoding='utf-8') as f:
-            results = json.load(f)
-        
-        return {"results": results}
-        
-    except Exception as e:
-        return {"results": [], "error": str(e)}
-
-@app.get("/api/view_markdown")
-async def view_markdown(file_path: str):
-    """View markdown file content in a popup"""
-    try:
-        markdown_path = Path(file_path)
-        
-        if not markdown_path.exists():
-            raise HTTPException(status_code=404, detail="Markdown file not found")
-        
-        with open(markdown_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # Create HTML response with markdown content
-        html_content = f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="UTF-8">
-    <title>Markdown Viewer - {markdown_path.name}</title>
-    <style>
-        body {{ 
-            font-family: 'Courier New', monospace; 
-            background: #0a0a0a; 
-            color: #00ff00; 
-            padding: 20px; 
-            line-height: 1.6;
-        }}
-        .header {{
-            background: #1a1a1a;
-            padding: 15px;
-            border-radius: 5px;
-            margin-bottom: 20px;
-            border: 1px solid #333;
-        }}
-        .content {{
-            background: #111;
-            padding: 20px;
-            border-radius: 5px;
-            border: 1px solid #333;
-            white-space: pre-wrap;
-            overflow-wrap: break-word;
-        }}
-        h1, h2, h3 {{ color: #00ff00; }}
-        a {{ color: #0080ff; }}
-    </style>
-</head>
-<body>
-    <div class="header">
-        <h2>📄 {markdown_path.name}</h2>
-        <p>Path: {file_path}</p>
-    </div>
-    <div class="content">{content}</div>
-</body>
-</html>
-"""
-        
-        return HTMLResponse(content=html_content)
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error reading markdown file: {e}")
-
-@app.get("/api/master_context/{context_id}")
-async def get_master_context(context_id: str):
-    """Get master context content"""
-    try:
-        contexts_dir = Path.home() / "remember" / "master_contexts"
-        contexts_dir.mkdir(exist_ok=True)
-        
-        context_file = contexts_dir / f"{context_id}.txt"
-        
-        # Context names mapping
-        context_names = {
-            "service_defects": "Service of Process Expert",
-            "tpa_violations": "TPA Violation Specialist", 
-            "court_procedure": "Court Procedure Guide",
-            "case_timeline": "Case Timeline Master"
-        }
-        
-        if context_file.exists():
-            with open(context_file, 'r', encoding='utf-8') as f:
-                content = f.read()
-        else:
-            # Create default content if file doesn't exist
-            content = f"Default {context_names.get(context_id, context_id)} context content. Please customize this with your specific requirements and instructions."
-            with open(context_file, 'w', encoding='utf-8') as f:
-                f.write(content)
-        
-        return {
-            "success": True,
-            "content": content,
-            "name": context_names.get(context_id, context_id)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/api/chat")
-async def chat_handler(request: ChatRequest):
-    """Handle chat requests using LLM function calling to MCP server with comprehensive logging"""
-    session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-    
-    try:
-        # Log incoming request
-        log_llm_interaction("INCOMING_REQUEST", {
-            "message": request.message,
-            "files": request.files,
-            "provider": request.provider,
-            "master_contexts": request.master_contexts,
-            "database": request.database
-        }, session_id)
-
-        # 1. Load Master Contexts
-        master_context_content = ""
-        if request.master_contexts:
-            contexts_dir = Path.home() / "remember" / "master_contexts"
-            for context_id in request.master_contexts:
-                context_file = contexts_dir / f"{context_id}.txt"
-                if context_file.exists():
-                    with open(context_file, 'r', encoding='utf-8') as f:
-                        context_text = f.read()
-                        master_context_content += f"""--- MASTER CONTEXT: {context_id} ---
-{context_text}
-
-"""
-        
-        log_llm_interaction("MASTER_CONTEXTS_LOADED", {
-            "contexts": request.master_contexts,
-            "content_length": len(master_context_content)
-        }, session_id)
-
-        # 2. Construct system prompt with master contexts
-        file_instructions = ""
-        if request.files:
-            # Convert file URLs to vector IDs for direct access
-            vector_ids = []
-            for i, file_url in enumerate(request.files, 1):
-                vector_id = f"doc_{i:03d}"
-                vector_ids.append(vector_id)
-            
-            vector_list = '\n'.join([f"- {vid}" for vid in vector_ids])
-            file_instructions = f"""
-
-PRIORITY DOCUMENTS TO ANALYZE:
-{vector_list}
-
-INSTRUCTIONS: Use get_document_by_id() to retrieve the exact content of these documents. Each document has a vector ID that directly accesses the content."""
-        else:
-            file_instructions = "\n\nINSTRUCTIONS: Use list_all_documents() to see available documents and their vector IDs, then use get_document_by_id() to retrieve specific documents."
-
-        system_prompt = f"""You are a Legal AI expert with access to a ChromaDB database through function calls.
-
-{master_context_content}
-
-USER QUERY: {request.message}
-{file_instructions}
-
-You have access to these function calling tools:
-- get_document_by_id: Get full content of a document by its vector ID (e.g., doc_001, doc_002)
-- list_all_documents: List all available documents with their vector IDs and titles
-- get_multiple_documents: Get content of multiple documents at once
-
-WORKFLOW:
-1. If specific document IDs are listed above, use get_document_by_id() to retrieve them directly
-2. If no specific documents are listed, use list_all_documents() to see what's available
-3. Analyze the retrieved documents according to the master context instructions provided
-4. Follow the exact output format specified in the master context"""
-
-        # 3. Get MCP tools for function calling
-        tools = get_mcp_tools()
-        
-        log_llm_interaction("TOOLS_LOADED", {
-            "tools_count": len(tools),
-            "available_tools": [tool["function"]["name"] for tool in tools]
-        }, session_id)
-        
-        # 4. Create messages for LLM
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Please analyze the legal documents related to: {request.message}"}
-        ]
-
-        log_llm_interaction("LLM_REQUEST_PREPARED", {
-            "messages": messages,
-            "tools": tools,
-            "model": request.provider,
-            "system_prompt_length": len(system_prompt)
-        }, session_id)
-
-        # 5. Make function call to LLM
-        success, response, debug = groq_client.function_call_chat(
-            messages=messages,
-            tools=tools,
-            model=request.provider
-        )
-
-        log_llm_interaction("LLM_RESPONSE_RAW", {
-            "success": success,
-            "response": response,
-            "debug": debug,
-            "model_used": request.provider
-        }, session_id)
-
-        if not success:
-            error_msg = f"LLM function call failed: {debug}"
-            log_llm_interaction("LLM_ERROR", {"error": error_msg}, session_id)
-            raise HTTPException(status_code=500, detail=error_msg)
-
-        # 6. Process function calls if any
-        response_content = ""
-        function_results = []
-        
-        # Check if LLM made function calls
-        choices = response.get('choices', [])
-        if choices:
-            message = choices[0].get('message', {})
-            tool_calls = message.get('tool_calls', [])
-            
-            log_llm_interaction("FUNCTION_CALLS_DETECTED", {
-                "tool_calls_count": len(tool_calls),
-                "tool_calls": tool_calls
-            }, session_id)
-            
-            if tool_calls:
-                # Execute each function call
-                for tool_call in tool_calls:
-                    function_name = tool_call['function']['name']
-                    function_args = json.loads(tool_call['function']['arguments'])
-                    
-                    log_llm_interaction("EXECUTING_FUNCTION", {
-                        "function_name": function_name,
-                        "function_args": function_args
-                    }, session_id)
-                    
-                    # Execute the MCP tool
-                    tool_result = await execute_mcp_tool(function_name, function_args)
-                    
-                    log_llm_interaction("FUNCTION_RESULT", {
-                        "function_name": function_name,
-                        "result": tool_result
-                    }, session_id)
-                    
-                    function_results.append({
-                        "function": function_name,
-                        "arguments": function_args,
-                        "result": tool_result
-                    })
-                
-                # Create follow-up message with function results
-                messages.append({
-                    "role": "assistant",
-                    "content": message.get('content', ''),
-                    "tool_calls": tool_calls
-                })
-                
-                # Add function results
-                for i, tool_call in enumerate(tool_calls):
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tool_call['id'],
-                        "content": json.dumps(function_results[i]['result'])
-                    })
-                
-                log_llm_interaction("FINAL_LLM_REQUEST_PREPARED", {
-                    "messages_count": len(messages),
-                    "with_function_results": True
-                }, session_id)
-                
-                # Get final response from LLM
-                final_success, final_response, final_debug = groq_client.conversation_chat(
-                    messages=messages,
-                    model=request.provider
-                )
-                
-                log_llm_interaction("FINAL_LLM_RESPONSE", {
-                    "success": final_success,
-                    "response": final_response,
-                    "debug": final_debug
-                }, session_id)
-                
-                if final_success:
-                    response_content = final_response
-                else:
-                    response_content = f"Function calls executed but final response failed: {final_debug}"
-            else:
-                # No function calls, just direct response
-                response_content = message.get('content', 'No response content')
-        else:
-            response_content = "No response from LLM"
-
-        final_result = {
-            "response": response_content,
-            "debug_info": f"Function calls made: {len(function_results)}. Tools available: {len(tools)}",
-            "function_calls": function_results,
-            "model_used": request.provider,
-            "show_function_results": True,
-            "session_id": session_id,  # Include session ID for log viewing
-            "log_file": f"raw_llm_data_{datetime.now().strftime('%Y%m%d')}.json"
-        }
-        
-        log_llm_interaction("FINAL_RESULT", final_result, session_id)
-        
-        return final_result
-
-    except Exception as e:
-        import traceback
-        error_details = {
-            "error": str(e),
-            "traceback": traceback.format_exc()
-        }
-        log_llm_interaction("EXCEPTION", error_details, session_id)
-        print(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=str(e))
-
-class ContextRequest(BaseModel):
-    context_content: str
-    instructions: str
-    provider: str
-    api_key: str = "auto"
-
-@app.post("/api/improve_context")
-async def improve_context(request: ContextRequest):
-    """Send context to LLM for improvement"""
-    try:
-        # Prepare the message for the LLM
-        system_prompt = "You are an expert legal AI assistant. The user will provide you with a master context and instructions on how to improve it. Please follow their instructions carefully and provide an improved version."
-        
-        user_message = f"""
-CURRENT MASTER CONTEXT:
-{request.context_content}
-
-USER INSTRUCTIONS:
-{request.instructions}
-
-Please provide an improved version of this master context following the user's instructions.
-"""
-        
-        # Use the existing groq client
-        response = await groq_client.complete(
-            provider=request.provider,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
-            ],
-            api_key=request.api_key
-        )
-        
-        return {"response": response}
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM request failed: {e}")
-
-class SaveContextResponse(BaseModel):
-    context_id: str
-    response: str
-    timestamp: str
-
-@app.post("/api/save_context_response")
-async def save_context_response(request: SaveContextResponse):
-    """Save LLM response as a new context version"""
-    try:
-        responses_dir = Path.home() / "remember" / "context_responses"
-        responses_dir.mkdir(exist_ok=True)
-        
-        timestamp = request.timestamp.replace(':', '-').replace('.', '-')
-        filename = f"{request.context_id}_response_{timestamp}.txt"
-        
-        response_file = responses_dir / filename
-        
-        with open(response_file, 'w', encoding='utf-8') as f:
-            f.write(request.response)
-        
-        return {"success": True, "filename": filename}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-class UpdateContextRequest(BaseModel):
-    context_id: str
-    content: str
-
-@app.post("/api/update_master_context")
-async def update_master_context(request: UpdateContextRequest):
-    """Update the master context with new content"""
-    try:
-        contexts_dir = Path.home() / "remember" / "master_contexts"
-        contexts_dir.mkdir(exist_ok=True)
-        
-        context_file = contexts_dir / f"{request.context_id}.txt"
-        
-        # Backup current version
-        if context_file.exists():
-            backup_file = contexts_dir / f"{request.context_id}_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            with open(context_file, 'r', encoding='utf-8') as f:
-                backup_content = f.read()
-            with open(backup_file, 'w', encoding='utf-8') as f:
-                f.write(backup_content)
-        
-        # Save new content
-        with open(context_file, 'w', encoding='utf-8') as f:
-            f.write(request.content)
-        
-        return {"success": True}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-class LoadFileContentRequest(BaseModel):
-    url: str
-    markdown_file: str
-    json_content: str
-
-@app.post("/api/load_file_content")
-async def load_file_content(request: LoadFileContentRequest):
-    """Load file content for editing"""
-    try:
-        # Try to load from markdown file first, fallback to JSON content
-        markdown_path = Path(request.markdown_file)
-        
-        if markdown_path.exists():
-            with open(markdown_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-        else:
-            content = request.json_content
-        
-        return {"success": True, "content": content}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-class SaveFileContentRequest(BaseModel):
-    url: str
-    content: str
-    markdown_file: str
-    title: str
-
-@app.post("/api/save_file_content")
-async def save_file_content(request: SaveFileContentRequest):
-    """Save edited file content to both JSON and markdown"""
-    try:
-        # Save to markdown file with auto-backup
-        markdown_path = Path(request.markdown_file)
-        
-        # Create backups
-        if markdown_path.exists():
-            backup_dir = markdown_path.parent / "backups"
-            backup_dir.mkdir(exist_ok=True)
-            
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            backup_path = backup_dir / f"{markdown_path.stem}_backup_{timestamp}.md"
-            
-            # Keep only last 3 backups
-            backup_files = sorted(backup_dir.glob(f"{markdown_path.stem}_backup_*.md"))
-            if len(backup_files) >= 3:
-                # Remove oldest backups, keep only 2
-                for old_backup in backup_files[:-2]:
-                    old_backup.unlink()
-            
-            # Create new backup
-            with open(markdown_path, 'r', encoding='utf-8') as f:
-                backup_content = f.read()
-            with open(backup_path, 'w', encoding='utf-8') as f:
-                f.write(backup_content)
-        
-        # Save new content to markdown file
-        with open(markdown_path, 'w', encoding='utf-8') as f:
-            f.write(request.content)
-        
-        # Update JSON file
-        remember_dir = Path.home() / "remember"
-        json_files = list(remember_dir.glob("extraction_results_*.json"))
-        
-        if json_files:
-            latest_json = max(json_files, key=lambda f: f.stat().st_mtime)
-            
-            with open(latest_json, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            # Find and update the matching entry
-            for item in data:
-                if item.get('url') == request.url:
-                    item['content'] = request.content
-                    break
-            
-            # Save updated JSON
-            with open(latest_json, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2)
-        
-        return {"success": True}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-class AutoSaveRequest(BaseModel):
-    url: str
-    content: str
-    file_path: str
-
-@app.post("/api/auto_save_file")
-async def auto_save_file(request: AutoSaveRequest):
-    """Auto-save file content"""
-    try:
-        # Create auto-save directory
-        file_path = Path(request.file_path)
-        autosave_dir = file_path.parent / "autosave"
-        autosave_dir.mkdir(exist_ok=True)
-        
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        autosave_path = autosave_dir / f"{file_path.stem}_autosave_{timestamp}.md"
-        
-        # Save auto-save copy
-        with open(autosave_path, 'w', encoding='utf-8') as f:
-            f.write(request.content)
-        
-        # Keep only last 5 auto-saves
-        autosave_files = sorted(autosave_dir.glob(f"{file_path.stem}_autosave_*.md"))
-        if len(autosave_files) > 5:
-            for old_file in autosave_files[:-5]:
-                old_file.unlink()
-        
-        return {"success": True}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-class LoadVersionRequest(BaseModel):
-    url: str
-    version: str
-    file_path: str
-
-@app.post("/api/load_file_version")
-async def load_file_version(request: LoadVersionRequest):
-    """Load specific version of file"""
-    try:
-        file_path = Path(request.file_path)
-        
-        if request.version == "current":
-            # Load current version
-            if file_path.exists():
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-            else:
-                content = ""
-        else:
-            # Load backup version
-            backup_dir = file_path.parent / "backups"
-            backup_files = sorted(backup_dir.glob(f"{file_path.stem}_backup_*.md"))
-            
-            if request.version == "backup1" and len(backup_files) >= 1:
-                with open(backup_files[-1], 'r', encoding='utf-8') as f:
-                    content = f.read()
-            elif request.version == "backup2" and len(backup_files) >= 2:
-                with open(backup_files[-2], 'r', encoding='utf-8') as f:
-                    content = f.read()
-            elif request.version == "original" and len(backup_files) >= 1:
-                with open(backup_files[0], 'r', encoding='utf-8') as f:
-                    content = f.read()
-            else:
-                return {"success": False, "error": "Version not found"}
-        
-        return {"success": True, "content": content}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-# ===============================
-# MASTER CONTEXT API ENDPOINTS
-# ===============================
-
-@app.get("/api/master_contexts/list")
-async def list_master_contexts():
-    """List all master contexts with metadata"""
-    try:
-        contexts_dir = Path.home() / "remember" / "master_contexts"
-        contexts_dir.mkdir(exist_ok=True)
-        
-        contexts = []
-        for context_file in contexts_dir.glob("*.txt"):
-            try:
-                stat = context_file.stat()
-                with open(context_file, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                
-                contexts.append({
-                    "id": context_file.stem,
-                    "size": len(content),
-                    "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
-                })
-            except Exception:
-                continue
-        
-        contexts.sort(key=lambda x: x["id"])
-        return {"success": True, "contexts": contexts}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-class CreateContextRequest(BaseModel):
-    id: str
-    content: str
-
-@app.post("/api/master_contexts/create")
-async def create_master_context(request: CreateContextRequest):
-    """Create new master context"""
-    try:
-        contexts_dir = Path.home() / "remember" / "master_contexts"
-        contexts_dir.mkdir(exist_ok=True)
-        
-        # Clean context ID
-        context_id = re.sub(r'[^a-zA-Z0-9_-]', '_', request.id.strip())
-        if not context_id:
-            return {"success": False, "error": "Invalid context ID"}
-        
-        context_file = contexts_dir / f"{context_id}.txt"
-        
-        # Check if already exists
-        if context_file.exists():
-            return {"success": False, "error": f"Context '{context_id}' already exists"}
-        
-        # Save context
-        with open(context_file, 'w', encoding='utf-8') as f:
-            f.write(request.content)
-        
-        return {"success": True, "message": f"Context '{context_id}' created successfully"}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.delete("/api/master_contexts/delete/{context_id}")
-async def delete_master_context(context_id: str):
-    """Delete master context"""
-    try:
-        contexts_dir = Path.home() / "remember" / "master_contexts"
-        context_file = contexts_dir / f"{context_id}.txt"
-        
-        if not context_file.exists():
-            return {"success": False, "error": f"Context '{context_id}' not found"}
-        
-        # Create backup before deletion
-        backup_dir = contexts_dir / "deleted_backups"
-        backup_dir.mkdir(exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_file = backup_dir / f"{context_id}_deleted_{timestamp}.txt"
-        
-        # Copy to backup
-        import shutil
-        shutil.copy2(context_file, backup_file)
-        
-        # Delete original
-        context_file.unlink()
-        
-        return {"success": True, "message": f"Context '{context_id}' deleted (backup saved)"}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-# ===============================
-# NOTES API ENDPOINTS
-# ===============================
-
-class CreateNoteRequest(BaseModel):
-    content: str
-
-class QuickNoteRequest(BaseModel):
-    content: str
-    timestamp: str
-
-@app.post("/api/notes/create")
-async def create_note(request: CreateNoteRequest):
-    """Create a new note"""
-    try:
-        notes_dir = Path.home() / "remember" / "notes"
-        notes_dir.mkdir(exist_ok=True)
-        
-        # Generate note ID
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        note_id = f"note_{timestamp}"
-        
-        note_data = {
-            "id": note_id,
-            "content": request.content,
-            "timestamp": datetime.now().isoformat(),
-            "created": datetime.now().isoformat()
-        }
-        
-        note_file = notes_dir / f"{note_id}.json"
-        with open(note_file, 'w', encoding='utf-8') as f:
-            json.dump(note_data, f, indent=2)
-        
-        return {"success": True, "note_id": note_id}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.post("/api/notes/quick")
-async def save_quick_note(request: QuickNoteRequest):
-    """Save quick note from sidebar"""
-    try:
-        notes_dir = Path.home() / "remember" / "notes"
-        notes_dir.mkdir(exist_ok=True)
-        
-        # Use timestamp from request or generate new one
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        note_id = f"quick_{timestamp}"
-        
-        note_data = {
-            "id": note_id,
-            "content": request.content,
-            "timestamp": request.timestamp,
-            "type": "quick",
-            "created": datetime.now().isoformat()
-        }
-        
-        note_file = notes_dir / f"{note_id}.json"
-        with open(note_file, 'w', encoding='utf-8') as f:
-            json.dump(note_data, f, indent=2)
-        
-        return {"success": True, "note_id": note_id}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.get("/api/notes/list")
-async def list_notes():
-    """List all notes"""
-    try:
-        notes_dir = Path.home() / "remember" / "notes"
-        notes_dir.mkdir(exist_ok=True)
-        
-        notes = []
-        for note_file in notes_dir.glob("*.json"):
-            try:
-                with open(note_file, 'r', encoding='utf-8') as f:
-                    note_data = json.load(f)
-                notes.append(note_data)
-            except Exception:
-                continue
-        
-        # Sort by creation time (newest first)
-        notes.sort(key=lambda x: x.get("created", ""), reverse=True)
-        
-        return {"success": True, "notes": notes}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.delete("/api/notes/delete/{note_id}")
-async def delete_note(note_id: str):
-    """Delete a note"""
-    try:
-        notes_dir = Path.home() / "remember" / "notes"
-        note_file = notes_dir / f"{note_id}.json"
-        
-        if not note_file.exists():
-            return {"success": False, "error": f"Note '{note_id}' not found"}
-        
-        # Create backup before deletion
-        backup_dir = notes_dir / "deleted_backups"
-        backup_dir.mkdir(exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        backup_file = backup_dir / f"{note_id}_deleted_{timestamp}.json"
-        
-        # Copy to backup
-        import shutil
-        shutil.copy2(note_file, backup_file)
-        
-        # Delete original
-        note_file.unlink()
-        
-        return {"success": True, "message": f"Note '{note_id}' deleted (backup saved)"}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-# ===============================
-# FILE MANAGEMENT API ENDPOINTS  
-# ===============================
-
-@app.delete("/api/database/{db_name}/file/{file_id}")
-async def delete_database_file(db_name: str, file_id: str):
-    """Delete a file from the database"""
-    try:
-        client = get_client()
-        
-        # Get the collection
-        try:
-            collection = client.get_collection(db_name)
-        except Exception:
-            return {"success": False, "error": f"Database '{db_name}' not found"}
-        
-        # Delete the document
-        collection.delete(ids=[file_id])
-        
-        return {"success": True, "message": f"File '{file_id}' deleted from '{db_name}'"}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-# ===============================
-# MARKDOWN FILE API ENDPOINTS
-# ===============================
-
-@app.get("/api/load_markdown_content")
-async def load_markdown_content(file_path: str):
-    """Load markdown file content for editing"""
-    try:
-        markdown_path = Path(file_path)
-        
-        if not markdown_path.exists():
-            return {"success": False, "error": f"File not found: {file_path}"}
-        
-        with open(markdown_path, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        return {"success": True, "content": content}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-class SaveMarkdownRequest(BaseModel):
-    file_path: str
-    content: str
-    url: str
-
-@app.post("/api/save_markdown_content")
-async def save_markdown_content(request: SaveMarkdownRequest):
-    """Save markdown file and update JSON + re-import to MCP"""
-    try:
-        markdown_path = Path(request.file_path)
-        
-        # 1. Create backup of markdown file
-        if markdown_path.exists():
-            backup_dir = markdown_path.parent / "backups"
-            backup_dir.mkdir(exist_ok=True)
-            
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_file = backup_dir / f"{markdown_path.stem}_backup_{timestamp}.md"
-            
-            import shutil
-            shutil.copy2(markdown_path, backup_file)
-        
-        # 2. Save updated markdown file
-        with open(markdown_path, 'w', encoding='utf-8') as f:
-            f.write(request.content)
-        
-        # 3. Find and update the corresponding JSON file
-        remember_dir = Path.home() / "remember"
-        json_files = list(remember_dir.glob("extraction_results_*.json"))
-        
-        if not json_files:
-            return {"success": False, "error": "No extraction JSON files found"}
-        
-        # Find the latest JSON file
-        latest_json = max(json_files, key=lambda f: f.stat().st_mtime)
-        
-        # 4. Update JSON entry
-        with open(latest_json, 'r', encoding='utf-8') as f:
-            json_data = json.load(f)
-        
-        # Find the entry by URL and update content
-        updated = False
-        for entry in json_data:
-            if entry.get('url') == request.url:
-                # Extract title and content from markdown for JSON
-                lines = request.content.split('\n')
-                title = lines[0].lstrip('# ') if lines and lines[0].startswith('#') else entry.get('title', 'Unknown')
-                
-                # Remove markdown header for clean content
-                content_lines = lines[1:] if lines and lines[0].startswith('#') else lines
-                clean_content = '\n'.join(content_lines).strip()
-                
-                entry['content'] = clean_content
-                entry['title'] = title
-                updated = True
-                break
-        
-        if not updated:
-            return {"success": False, "error": f"No JSON entry found for URL: {request.url}"}
-        
-        # 5. Save updated JSON
-        backup_json = remember_dir / f"{latest_json.stem}_backup_{timestamp}.json"
-        shutil.copy2(latest_json, backup_json)
-        
-        with open(latest_json, 'w', encoding='utf-8') as f:
-            json.dump(json_data, f, indent=2)
-        
-        # 6. Re-import to MCP ChromaDB
-        try:
-            import_result = import_extraction_session(str(latest_json))
-            return {
-                "success": True, 
-                "message": "Markdown saved, JSON updated, and re-imported to MCP",
-                "import_result": import_result
-            }
-        except Exception as import_error:
-            return {
-                "success": True,
-                "message": "Markdown and JSON updated, but MCP re-import failed",
-                "import_error": str(import_error)
-            }
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-class GetDocumentRequest(BaseModel):
-    document_id: str
-
-@app.post("/api/mcp_get_document")
-async def mcp_get_document(request: GetDocumentRequest):
-    """Get full document content via MCP server"""
-    try:
-        result = await execute_mcp_tool("get_document_content", {"document_id": request.document_id})
-        
-        if result.get("success"):
-            return {"success": True, "document": result["document"]}
-        else:
-            return {"success": False, "error": result.get("error", "Unknown error")}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-# ===============================
-# LLM RESPONSE MANAGEMENT API
-# ===============================
-
-class SaveResponseRequest(BaseModel):
-    title: str
-    content: str
-    timestamp: str
-
 @app.post("/api/save_response_to_mcp")
-async def save_response_to_mcp(request: SaveResponseRequest):
+async def save_response_to_mcp(request: dict):
     """Save LLM response to MCP database"""
     try:
-        # Create a unique ID for the response
-        response_id = f"llm_response_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        content = request.get("content", "")
+        database = request.get("database", "remember_db")
+        timestamp = request.get("timestamp", datetime.now().isoformat())
         
-        # Add to ChromaDB
-        client = get_client()
-        collection_name = "llm_responses"
+        if not content:
+            return {"success": False, "error": "No content provided"}
         
-        try:
-            collection = client.get_collection(collection_name)
-        except:
-            # Create collection if it doesn't exist
-            collection = client.create_collection(collection_name)
+        # Get database client
+        if database == "remember_db":
+            client = get_client()
+        else:
+            db_path = Path.home() / database
+            client = chromadb.PersistentClient(path=str(db_path))
         
+        # Create collection for LLM responses
+        collection_name = f"llm_responses_{datetime.now().strftime('%Y%m')}"
+        collection = get_or_create_collection(collection_name)
+        
+        # Generate vector ID
+        doc_count = collection.count()
+        vector_id = f"llm_response_{doc_count + 1:03d}"
+        
+        # Create metadata
         metadata = {
-            "title": str(request.title),
-            "timestamp": str(request.timestamp),
-            "type": "llm_response",
-            "created": datetime.now().isoformat(),
-            "rating": 5  # Default high rating for LLM responses
+            "title": f"LLM Response {timestamp[:19]}",
+            "type": "llm_response", 
+            "timestamp": timestamp,
+            "source": "chat_interface",
+            "model": "deepseek-r1-distill-llama-70b"
         }
         
+        # Add to collection
         collection.add(
-            documents=[request.content],
+            documents=[content],
             metadatas=[metadata],
-            ids=[response_id]
+            ids=[vector_id]
         )
         
-        return {"success": True, "response_id": response_id, "message": "Response saved to MCP database"}
+        # Also save as markdown file
+        responses_dir = Path.home() / "remember" / "llm_responses"
+        responses_dir.mkdir(exist_ok=True)
         
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-# ===============================
-# PC FILE BROWSER API
-# ===============================
-
-class BrowsePCFilesRequest(BaseModel):
-    path: str
-
-@app.post("/api/browse_pc_files")
-async def browse_pc_files(request: BrowsePCFilesRequest):
-    """Browse PC file system"""
-    try:
-        path = Path(request.path)
+        md_filename = f"response_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+        md_file = responses_dir / md_filename
         
-        if not path.exists():
-            return {"success": False, "error": f"Path not found: {request.path}"}
-        
-        files = []
-        for item in path.iterdir():
-            try:
-                stat = item.stat()
-                files.append({
-                    "name": item.name,
-                    "path": str(item),
-                    "type": "folder" if item.is_dir() else "file",
-                    "size": f"{stat.st_size} bytes" if item.is_file() else "",
-                    "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
-                })
-            except Exception:
-                continue
-        
-        # Sort: folders first, then files
-        files.sort(key=lambda x: (x["type"] != "folder", x["name"].lower()))
-        
-        return {"success": True, "files": files[:100]}  # Limit to 100 items
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-class AddFilesToMCPRequest(BaseModel):
-    files: List[str]
-    database: str
-
-@app.post("/api/add_files_to_mcp")
-async def add_files_to_mcp(request: AddFilesToMCPRequest):
-    """Add selected PC files to MCP database"""
-    try:
-        client = get_client()
-        
-        # Get or create collection
-        collection_name = f"pc_files_{datetime.now().strftime('%Y%m%d')}"
-        try:
-            collection = client.get_collection(collection_name)
-        except:
-            collection = client.create_collection(collection_name)
-        
-        added_count = 0
-        for file_path in request.files:
-            try:
-                path = Path(file_path)
-                if not path.exists() or not path.is_file():
-                    continue
-                
-                # Read file content
-                try:
-                    with open(path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                except UnicodeDecodeError:
-                    # Skip binary files
-                    continue
-                
-                # Create metadata
-                stat = path.stat()
-                file_id = f"pc_file_{hashlib.md5(str(path).encode()).hexdigest()}"
-                metadata = {
-                    "title": str(path.name),
-                    "file_path": str(path),
-                    "type": "pc_file",
-                    "size": stat.st_size,
-                    "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
-                    "created": datetime.now().isoformat(),
-                    "rating": 3  # Default rating for PC files
-                }
-                
-                collection.add(
-                    documents=[content],
-                    metadatas=[metadata],
-                    ids=[file_id]
-                )
-                
-                added_count += 1
-                
-            except Exception as e:
-                print(f"Error adding file {file_path}: {e}")
-                continue
-        
-        return {"success": True, "files_added": added_count, "collection": collection_name}
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-class AddFolderToMCPRequest(BaseModel):
-    folder_path: str
-    database: str
-
-@app.post("/api/add_folder_to_mcp")
-async def add_folder_to_mcp(request: AddFolderToMCPRequest):
-    """Add all files from a folder to MCP database"""
-    try:
-        folder_path = Path(request.folder_path)
-        
-        if not folder_path.exists() or not folder_path.is_dir():
-            return {"success": False, "error": f"Folder not found: {request.folder_path}"}
-        
-        # Get all files recursively
-        all_files = []
-        for file_path in folder_path.rglob('*'):
-            if file_path.is_file():
-                all_files.append(str(file_path))
-        
-        # Use existing add_files_to_mcp logic
-        add_request = AddFilesToMCPRequest(files=all_files, database=request.database)
-        return await add_files_to_mcp(add_request)
-        
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-@app.get("/api/test_mcp")
-async def test_mcp_integration():
-    """Test MCP function calling integration"""
-    try:
-        # Test 1: Get available tools
-        tools = get_mcp_tools()
-        
-        # Test 2: Test basic search
-        search_result = await execute_mcp_tool("search_documents", {"query": "service", "limit": 3})
-        
-        # Test 3: Test collections
-        collections_result = await execute_mcp_tool("list_collections", {})
+        with open(md_file, 'w', encoding='utf-8') as f:
+            f.write(f"# LLM Response - {timestamp[:19]}\n\n")
+            f.write(f"**Vector ID:** {vector_id}\n")
+            f.write(f"**Timestamp:** {timestamp}\n")
+            f.write(f"**Model:** deepseek-r1-distill-llama-70b\n\n")
+            f.write("---\n\n")
+            f.write(content)
         
         return {
             "success": True,
-            "tools_count": len(tools),
-            "available_tools": [tool["name"] for tool in tools],
-            "search_test": {
-                "success": search_result.get("success", False),
-                "documents_found": search_result.get("count", 0)
-            },
-            "collections_test": {
-                "success": collections_result.get("success", False),
-                "collections_count": len(collections_result.get("collections", []))
-            },
-            "status": "MCP integration working correctly"
-        }
-    
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e),
-            "status": "MCP integration failed"
-        }
-
-@app.get("/api/view_llm_logs")
-async def view_llm_logs(session_id: Optional[str] = None, limit: int = 50):
-    """View raw LLM interaction logs"""
-    try:
-        logs_dir = Path.home() / "remember" / "llm_logs"
-        log_file = logs_dir / f"raw_llm_data_{datetime.now().strftime('%Y%m%d')}.json"
-        
-        if not log_file.exists():
-            return {"success": False, "error": "No log file found for today"}
-        
-        # Read the log file
-        with open(log_file, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # Split by separator
-        entries = content.split("=" * 50)
-        log_entries = []
-        
-        for entry in entries:
-            if entry.strip():
-                try:
-                    log_data = json.loads(entry.strip())
-                    # Filter by session_id if provided
-                    if session_id is None or log_data.get('session_id', '').startswith(session_id):
-                        log_entries.append(log_data)
-                except json.JSONDecodeError:
-                    continue
-        
-        # Sort by timestamp and limit
-        log_entries.sort(key=lambda x: x.get('timestamp', ''), reverse=True)
-        log_entries = log_entries[:limit]
-        
-        return {
-            "success": True,
-            "entries": log_entries,
-            "total_entries": len(log_entries),
-            "log_file": str(log_file)
+            "vector_id": vector_id,
+            "collection": collection_name,
+            "markdown_file": str(md_file)
         }
         
     except Exception as e:
@@ -4568,23 +3066,66 @@ async def view_session_logs(session_id: str):
         # Sort by timestamp
         session_entries.sort(key=lambda x: x.get('timestamp', ''))
         
-        return {
-            "success": True,
-            "session_id": session_id,
-            "entries": session_entries,
-            "total_entries": len(session_entries)
-        }
+        html_content = """<html><head><title>Session Logs</title>
+        <style>
+            body { font-family: monospace; background-color: #1e1e1e; color: #d4d4d4; }
+            .log-entry { border: 1px solid #333; padding: 10px; margin-bottom: 10px; border-radius: 5px; }
+            .user { background-color: #2a2a2a; }
+            .assistant { background-color: #253525; }
+            .tool { background-color: #352525; }
+            .timestamp { font-size: 0.8em; color: #888; }
+            .session-title { color: #4ec9b0; font-size: 1.5em; margin-bottom: 20px; }
+        </style>
+        </head><body>
+        """
+        
+        html_content += f"<div class='session-title'>Log for Session: {session_id}</div>"
+        
+        for log in session_entries:
+            log_type = log.get('type', 'unknown')
+            timestamp = log.get('timestamp', '')
+            data = log.get('data', {})
+            
+            html_content += f"<div class='log-entry {log_type}'>"
+            html_content += f"<div class='timestamp'>{timestamp}</div>"
+            html_content += f"<strong>Type:</strong> {log_type}<br>"
+            
+            if isinstance(data, dict):
+                for key, value in data.items():
+                    # Pretty print nested JSON
+                    if isinstance(value, (dict, list)):
+                        value_str = json.dumps(value, indent=2)
+                        html_content += f"<strong>{key}:</strong><br><pre>{value_str}</pre>"
+                    else:
+                        html_content += f"<strong>{key}:</strong> {value}<br>"
+            else:
+                html_content += f"<pre>{data}</pre>"
+            
+            html_content += "</div>"
+            
+        html_content += "</body></html>"
+        
+        return HTMLResponse(content=html_content)
         
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 if __name__ == "__main__":
-    import uvicorn
-    print("\n🔗 Remember Legal AI War Room Starting...")
-    print(f"📊 Groq Keys: {len(groq_client.router.api_manager.api_keys)}")
-    print(f"🤖 MCP Tools: {len(get_mcp_tools())}")
-    print(f"🎯 System Ready: http://localhost:8080")
-    print(f"🧪 Test MCP: http://localhost:8080/api/test_mcp")
-    print("="*50)
+    # Check for --headless argument
+    is_headless = "--headless" in sys.argv
+
+    # Get the script's directory
+    script_dir = Path(__file__).parent.absolute()
     
-    uvicorn.run(app, host="0.0.0.0", port=8080, log_level="info")
+    # Set the Uvicorn log level to warning to reduce console noise
+    log_level = "info"
+    
+    # Start Uvicorn server
+    uvicorn.run(
+        "remember_web_ui:app", 
+        host="0.0.0.0", 
+        port=8080, 
+        reload=False,
+        log_level=log_level,
+        reload_dirs=[str(script_dir)] 
+    )

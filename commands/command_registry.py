@@ -46,3 +46,5 @@ class CommandRegistry:
             return handler.execute(command_input)
         except Exception as e:
             return format_single_message(f"Error executing '{command_word}': {e}", "error")
+
+

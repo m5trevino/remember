@@ -1,13 +1,37 @@
-.env*
-*.env
-*key*
-*secret*
-*token*
-extraction_results_*
-urls.txt
+# Python
 __pycache__/
 *.pyc
-*.log
-remember_db/
-legal_results/
-projects.json
+*.pyo
+*.pyd
+
+# Environment & Secrets - VERY IMPORTANT
+.env
+api_key_manager.py
+
+# Generated Data & Logs
+llm_logs/
+llm_responses/
+scraped_content/
+pdfs/
+notes/
+master_contexts/
+
+# Backups and Temporary Files
+*.backup
+*.backup*
+*-backup.py
+*-backup1.py
+*(copy).py
+temp_*.js
+
+# OS-specific
+.DS_Store
+
+# Other specific files you wanted to ignore
+Untitled Folder/
+webui.py
+Screenshot_*.png
+LEGAL_AI_USAGE.md
+legal_ai_directive.md
+"Introduction to Tool Use - GroqDocs(2).md"
+"cfonts 'LEGAL|WAR ROOM' -f pallet -g yellow,re.py"
