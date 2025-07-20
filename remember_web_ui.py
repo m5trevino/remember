@@ -207,37 +207,16 @@ async def batch_process_generator(request: BatchProcessRequest):
         traceback.print_exc()
 
 
+async def batch_process_stream(request: BatchProcessRequest):
+    """Stream batch processing results in real-time"""
+    return StreamingResponse(
+        batch_process_generator(request),
+        media_type="text/plain",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+    )
+
+
 async def execute_mcp_tool(tool_name: str, params: dict):
-    """Execute MCP tool function"""
-    try:
-        if tool_name == "get_document_by_id":
-            document_id = params.get("document_id")
-            if not document_id:
-                return {"success": False, "error": "Missing document_id parameter"}
-            
-            # Get from database
-            client = get_client()
-            collections = client.list_collections()
-        if not documents:
-            error_data = {"type": "error", "error": "No selected documents found in database", "success": False}
-            yield f"data: {json.dumps(error_data)}\n\n"
-            return
-        
-        # Create batch results directory
-        batch_dir = Path.home() / "remember" / "batch_results"
-        batch_dir.mkdir(exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        batch_session_dir = batch_dir / f"batch_{timestamp}"
-        batch_session_dir.mkdir(exist_ok=True)
-        
-        batch_results = []
-        processed_count = 0
-        failed_count = 0
-        
-        for doc in documents:
-            doc_id = doc.get('id', 'unknown')
-            title = doc.get('title', 'Unknown Document')
             
             try:
                 # Get document content
