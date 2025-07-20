@@ -1,0 +1,52 @@
+graph TD
+    subgraph "User's World"
+        A[🌐 Browser/User]
+    end
+
+    subgraph "Remember Web UI (The Front)"
+        B(remember_web_ui.py):::fastapi
+        B -- "GET /api/databases" --> D
+        B -- "POST /api/chat" --> C
+        B -- "POST /api/batch_process" --> C
+        B -- "Triggers MCP Tools via LLM" --> G
+    end
+
+    subgraph "Groq Infrastructure (The Muscle)"
+        C(groq_client.py):::groq
+        C -- "Manages context" --> F(context_manager.py)
+        C -- "Makes resilient API call" --> E(request_router.py)
+        E -- "Gets API key" --> H(api_key_manager.py)
+        E -- "Gets proxy" --> I(proxy_manager.py)
+        E -- "Sends request to" --> J[🔥 Groq API]
+    end
+
+    subgraph "Database Layer (The Vault)"
+        D(core/database.py):::db
+        G(mcp_server.py):::db
+        D -- "CRUD ops" --> K[(🗄️ ChromaDB)]
+        G -- "Provides tool access to" --> K
+    end
+    
+    subgraph "CLI Operation (The Street Corner)"
+        L[💻 Remember CLI]
+        L --> M(commands/command_registry.py)
+        M -- "Routes to" --> N(commands/legal_handler.py)
+        N -- "Uses" --> C
+        N -- "Also uses" --> D
+    end
+
+    subgraph "Shared Libraries"
+        O(core/visuals.py):::lib
+        P(master_contexts/*.txt):::lib
+    end
+
+    %% Connections & Data Flow
+    A --> B
+    C --> P
+    N --> O
+
+    %% Styling
+    classDef fastapi fill:#009485,stroke:#333,stroke-width:2px,color:#fff
+    classDef groq fill:#8B4513,stroke:#D2691E,stroke-width:2px,color:#fff
+    classDef db fill:#0055A4,stroke:#333,stroke-width:2px,color:#fff
+    classDef lib fill:#444,stroke:#666,stroke-width:2px,color:#ccc

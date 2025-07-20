@@ -1,0 +1,21 @@
+---
+Vector ID: doc_117
+Title: AB 1482 Exemptions in California 👉 "Demystifying AB 1482 Exemptions: A Must-Watch for California Rental Owners" ✨ 714-442-9741 https://martinezlawcenter.com/ https://martinezlawcenter.com/blog/ https://sites.google.com/view/martinezlawcenter/home https://martinezlawcenter.blogspot.com REVIEWS: https://maps.app.goo.gl/BYp4hCapLhbz4d8NA EVICTION COMMERCIAL: http://bit.ly/3se6Swa EVICTION TENANT LAW: http://bit.ly/2MIRYO9 COMMUNITY: https://rb.gy/txgpwj https://www.facebook.com/MartinezLawCenterCalifornia/ INSTAGRAM: https://bit.ly/3kVUAFT https://martinezaccidentattorney.com/ Email: tony@martinezlawcenter.com or mark@martinezlawcenter.com SEO Support: https://seostable.com/ https://mywebsite4you.com/ QUORA: https://martinezlawcentersspace.quora.com/ 👉 "AB 1482: How California's Rent Control Law Impacts Your Rental Property" Understanding AB 1482 Exemptions in California: What Landlords and Tenants Need to Know. AB 1482, also known as the Tenant Protection Act of 2019, has brought significant changes to California's rental market. This law provides rent control and eviction protections for many tenants across the state. However, it's crucial to understand that not all rental properties are subject to AB 1482. In this video, we'll dive deep into the exemptions to this law, helping both landlords and tenants navigate the complex world of rental regulations. First, we'll explore the exemption for housing that has been issued a certificate of occupancy within the past 15 years. This means that newer properties are not subject to the rent control provisions outlined in AB 1482. Understanding this exemption is critical for landlords who own newer rental properties and tenants who are considering renting in recently constructed buildings. | Martinez Law Center
+URL: https://www.facebook.com/MartinezLawCenterCalifornia/videos/ab-1482-exemptions-in-california-demystifying-ab-1482-exemptions-a-must-watch-fo/1465031300805042/
+Rating: 3⭐
+Session: 1752996002
+Imported: 2025-07-20 01:48:41
+---
+
+# AB 1482 Exemptions in California 👉 "Demystifying AB 1482 Exemptions: A Must-Watch for California Rental Owners" ✨ 714-442-9741 https://martinezlawcenter.com/ https://martinezlawcenter.com/blog/ https://sites.google.com/view/martinezlawcenter/home https://martinezlawcenter.blogspot.com REVIEWS: https://maps.app.goo.gl/BYp4hCapLhbz4d8NA EVICTION COMMERCIAL: http://bit.ly/3se6Swa EVICTION TENANT LAW: http://bit.ly/2MIRYO9 COMMUNITY: https://rb.gy/txgpwj https://www.facebook.com/MartinezLawCenterCalifornia/ INSTAGRAM: https://bit.ly/3kVUAFT https://martinezaccidentattorney.com/ Email: tony@martinezlawcenter.com or mark@martinezlawcenter.com SEO Support: https://seostable.com/ https://mywebsite4you.com/ QUORA: https://martinezlawcentersspace.quora.com/ 👉 "AB 1482: How California's Rent Control Law Impacts Your Rental Property" Understanding AB 1482 Exemptions in California: What Landlords and Tenants Need to Know. AB 1482, also known as the Tenant Protection Act of 2019, has brought significant changes to California's rental market. This law provides rent control and eviction protections for many tenants across the state. However, it's crucial to understand that not all rental properties are subject to AB 1482. In this video, we'll dive deep into the exemptions to this law, helping both landlords and tenants navigate the complex world of rental regulations. First, we'll explore the exemption for housing that has been issued a certificate of occupancy within the past 15 years. This means that newer properties are not subject to the rent control provisions outlined in AB 1482. Understanding this exemption is critical for landlords who own newer rental properties and tenants who are considering renting in recently constructed buildings. | Martinez Law Center
+
+**URL:** [https://www.facebook.com/MartinezLawCenterCalifornia/videos/ab-1482-exemptions-in-california-demystifying-ab-1482-exemptions-a-must-watch-fo/1465031300805042/](https://www.facebook.com/MartinezLawCenterCalifornia/videos/ab-1482-exemptions-in-california-demystifying-ab-1482-exemptions-a-must-watch-fo/1465031300805042/)
+**Extracted:** 2025-07-20 01:42:18
+**Characters:** 2
+**Tokens:** ~1
+**Rating:** ⭐⭐⭐
+
+---
+
+
+

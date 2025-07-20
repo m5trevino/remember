@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Remember System - The Digital Trap House Blueprint</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Courier New', monospace;
+            background: linear-gradient(135deg, #0a0a0a 0%, #111827 50%, #1a1a2e 100%);
+            color: #00ff41;
+            min-height: 100vh;
+            overflow-x: auto;
+        }
+        
+        .container {
+            padding: 30px;
+            min-width: 1400px;
+        }
+        
+        .header {
+            text-align: center;
+            margin-bottom: 40px;
+            border: 2px solid #00ff41;
+            padding: 20px;
+            background: rgba(0, 255, 65, 0.05);
+            text-shadow: 0 0 10px #00ff41;
+        }
+        
+        .header h1 {
+            font-size: 28px;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            font-size: 16px;
+            color: #ccc;
+        }
+        
+        .system-map {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 25px;
+            margin-bottom: 40px;
+        }
+        
+        .section {
+            border: 2px solid #00ff41;
+            border-radius: 8px;
+            padding: 20px;
+            background: rgba(17, 24, 39, 0.8);
+            backdrop-filter: blur(5px);
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        
+        .section-title {
+            background: #00ff41;
+            color: #000;
+            padding: 8px 15px;
+            margin: -32px auto 10px auto;
+            font-weight: bold;
+            text-align: center;
+            font-size: 18px;
+            border-radius: 4px;
+            width: fit-content;
+        }
+
+        .module {
+            background: rgba(0, 255, 65, 0.1);
+            border: 1px solid #00ff41;
+            padding: 12px;
+            border-radius: 4px;
+        }
+        
+        .module-name {
+            color: #ff6b35; /* Orange for filenames */
+            font-weight: bold;
+            font-size: 16px;
+            margin-bottom: 5px;
+        }
+        
+        .module-role {
+            color: #e0e0e0;
+            font-size: 14px;
+            margin-bottom: 8px;
+            font-style: italic;
+        }
+
+        .module-connects {
+            color: #ffd700; /* Yellow for connections */
+            font-size: 12px;
+            border-left: 2px solid #ffd700;
+            padding-left: 8px;
+            margin-top: 8px;
+        }
+        
+        .critical-path {
+            border-color: #ff1744; /* Red */
+        }
+        .critical-path .section-title { background: #ff1744; color: #fff; }
+
+        .db-layer {
+            border-color: #3b82f6; /* Blue */
+        }
+        .db-layer .section-title { background: #3b82f6; color: #fff; }
+
+        .resilience-layer {
+            border-color: #f97316; /* Orange */
+        }
+        .resilience-layer .section-title { background: #f97316; color: #fff; }
+
+        .data-layer {
+            border-color: #eab308; /* Yellow */
+        }
+        .data-layer .section-title { background: #eab308; color: #000; }
+
+        .pipeline {
+            grid-column: span 4;
+            padding: 20px;
+        }
+        
+        .pipeline-flow {
+            display: flex;
+            align-items: center;
+            justify-content: space-around;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        
+        .pipeline-step {
+            background: rgba(255, 23, 68, 0.2);
+            border: 1px solid #ff1744;
+            padding: 12px 18px;
+            border-radius: 5px;
+            text-align: center;
+            font-size: 14px;
+            position: relative;
+        }
+        
+        .pipeline-step:not(:last-child):after {
+            content: '→';
+            position: absolute;
+            right: -25px;
+            top: 50%;
+            transform: translateY(-50%);
+            color: #ff6b35;
+            font-size: 24px;
+            font-weight: bold;
+        }
+        
+        .legend {
+            grid-column: span 4;
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 20px;
+        }
+        
+        .legend-item {
+            padding: 15px;
+            text-align: center;
+            border-radius: 5px;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>REMEMBER SYSTEM - THE DIGITAL TRAP HOUSE BLUEPRINT</h1>
+            <p>Every Route, Every Connection, Every Play. Real Gs Map Their Hustle.</p>
+        </div>
+        
+        <div class="system-map">
+            <!-- FRONTEND / USER INTERFACE -->
+            <div class="section critical-path">
+                <div class="section-title">🖥️ THE FRONTEND</div>
+                <div class="module">
+                    <div class="module-name">remember_web_ui.py</div>
+                    <div class="module-role">The Command Center. Runs the whole UI.</div>
+                    <div class="module-connects">→ Calls GroqClient for analysis.<br>→ Calls MCP Server via LLM.<br>→ Calls Core DB for file lists.</div>
+                </div>
+                <div class="module">
+                    <div class="module-name">CLI (Commands/*)</div>
+                    <div class="module-role">The Street Corner. For direct terminal plays.</div>
+                    <div class="module-connects">→ Uses LegalHandler to call GroqClient.</div>
+                </div>
+            </div>
+            
+            <!-- CORE ORCHESTRATION -->
+            <div class="section critical-path">
+                <div class="section-title">🧠 THE ORCHESTRATOR</div>
+                <div class="module">
+                    <div class="module-name">groq_client.py</div>
+                    <div class="module-role">The Shot Caller. Makes all AI plays happen.</div>
+                    <div class="module-connects">→ Uses RequestRouter for all API calls.<br>→ Uses ContextManager to prep data.</div>
+                </div>
+            </div>
+            
+            <!-- RESILIENCE LAYER -->
+            <div class="section resilience-layer">
+                <div class="section-title">🛡️ THE MUSCLE (Resilience)</div>
+                <div class="module">
+                    <div class="module-name">request_router.py</div>
+                    <div class="module-role">The Strategist. Handles retries & fallbacks.</div>
+                    <div class="module-connects">→ Gets keys from APIKeyManager.<br>→ Gets proxies from ProxyManager.</div>
+                </div>
+                <div class="module">
+                    <div class="module-name">api_key_manager.py</div>
+                    <div class="module-role">The Keymaster. Rotates API keys like a deck of cards.</div>
+                    <div class="module-connects">→ Standalone. Feeds the Router.</div>
+                </div>
+                <div class="module">
+                    <div class="module-name">proxy_manager.py</div>
+                    <div class="module-role">The Getaway Driver. Rotates IPs to stay ghost.</div>
+                    <div class="module-connects">→ Standalone. Feeds the Router.</div>
+                </div>
+            </div>
+
+            <!-- DATABASE & DATA LAYER -->
+            <div class="section db-layer">
+                <div class="section-title">🗄️ THE VAULT (Database)</div>
+                <div class="module">
+                    <div class="module-name">core/database.py</div>
+                    <div class="module-role">The Gatekeeper. Handles all direct DB operations.</div>
+                    <div class="module-connects">→ Imports/Searches ChromaDB.</div>
+                </div>
+                <div class="module">
+                    <div class="module-name">mcp_server.py</div>
+                    <div class="module-role">The Inside Man. Exposes DB functions as tools for the LLM.</div>
+                    <div class="module-connects">→ Uses Core DB to access ChromaDB.</div>
+                </div>
+                 <div class="module data-layer">
+                    <div class="module-name">context_manager.py</div>
+                    <div class="module-role">The Accountant. Chops up big data to fit token limits.</div>
+                    <div class="module-connects">→ Used by GroqClient before making calls.</div>
+                </div>
+            </div>
+        </div>
+        
+        <!-- PIPELINE FLOW -->
+        <div class="section pipeline critical-path">
+            <div class="section-title">🔄 THE MAIN HUSTLE: A Function-Call Request</div>
+            <div class="pipeline-flow">
+                <div class="pipeline-step">1. UI Request</div>
+                <div class="pipeline-step">2. GroqClient</div>
+                <div class="pipeline-step">3. RequestRouter</div>
+                <div class="pipeline-step">4. Groq API (Q)</div>
+                <div class="pipeline-step">5. LLM Tool Call</div>
+                <div class="pipeline-step">6. MCP Server</div>
+                <div class="pipeline-step">7. ChromaDB</div>
+                <div class="pipeline-step">8. Groq API (A)</div>
+                <div class="pipeline-step">9. UI Response</div>
+            </div>
+        </div>
+        
+        <!-- LEGEND -->
+        <div class="section">
+            <div class="section-title">🗺️ BLUEPRINT LEGEND</div>
+            <div class="legend">
+                <div class="legend-item critical-path">
+                    <h4>CRITICAL PATH</h4>
+                    <p>Main flow from user input to final answer.</p>
+                </div>
+                <div class="legend-item resilience-layer">
+                    <h4>RESILIENCE LAYER</h4>
+                    <p>Bulletproof routing, keys, and proxies.</p>
+                </div>
+                <div class="legend-item db-layer">
+                    <h4>DATABASE LAYER</h4>
+                    <p>The vault and its access points.</p>
+                </div>
+                <div class="legend-item data-layer">
+                    <h4>DATA PREP</h4>
+                    <p>Modules that handle data before it's sent.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

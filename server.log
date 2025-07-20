@@ -1,0 +1,4 @@
+  File "/home/flintx/remember/remember_web_ui.py", line 216
+    return {"success": False, "error": "Missing document_id parameter"}
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+SyntaxError: 'return' with value in async generator

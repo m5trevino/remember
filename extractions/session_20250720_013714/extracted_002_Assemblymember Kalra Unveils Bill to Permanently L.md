@@ -1,0 +1,20 @@
+---
+Vector ID: doc_002
+Title: Assemblymember Kalra Unveils Bill to Permanently Lower State Rent Increase Cap | Official Website - Assemblymember Ash Kalra Representing the 25th California Assembly District
+URL: https://a25.asmdc.org/press-releases/20250402-assemblymember-kalra-unveils-bill-permanently-lower-state-rent-increase-cap
+Rating: 3⭐
+Session: 1752996002
+Imported: 2025-07-20 01:48:41
+---
+
+# Assemblymember Kalra Unveils Bill to Permanently Lower State Rent Increase Cap | Official Website - Assemblymember Ash Kalra Representing the 25th California Assembly District
+
+**URL:** [https://a25.asmdc.org/press-releases/20250402-assemblymember-kalra-unveils-bill-permanently-lower-state-rent-increase-cap](https://a25.asmdc.org/press-releases/20250402-assemblymember-kalra-unveils-bill-permanently-lower-state-rent-increase-cap)
+**Extracted:** 2025-07-20 01:37:16
+**Characters:** 3,078
+**Tokens:** ~681
+**Rating:** ⭐⭐⭐
+
+---
+
+SACRAMENTO – Assemblymember Ash Kalra (D-San José) announced Assembly Bill (AB) 1157, the Affordable Rent Act, which strengthens tenant protections statewide by updating the Tenant Protection Act of 2019 (AB 1482) in three key ways: lowering the rent increase cap, extending tenant protections to single-family homes, and making these safeguards permanent. “When we passed the original Tenant Protection Act almost 6 years ago, it was a major victory for tenant protection in enacting not only anti-rent gouging legislation, but eviction protections as well. Unfortunately, rates throughout the rental market continue to rise rapidly and wages have not come close to keeping up. With existing law, rent can still increase by hundreds of dollars, renters in single-family homes are excluded from tenant protections, and it is set to sunset in a few short years,” said Assemblymember Kalra. “With renters making up roughly half of the state’s population, California must take every step to help keep families from being displaced, keep workers near their jobs, and ensure no one is pushed into homelessness due to a substantial rent increase. I am honored to author AB 1157, the Affordable Rent Act, and grateful to be joined by a large coalition in support and coauthors who recognize existing law is not enough—these are safeguards we must bolster.” In 2019, California passed the Tenant Protection Act which created rent gouging and eviction protections to tenants across the state. Over the years, the cost of rent has continued to increase, making it unaffordable for many working families. Parts of California that were once considered affordable for families to rent have seen some of the biggest rent increases. According to data sourced from the Zillow Rent Index observing 2020 to 2023, rent has increased nearly 40% in many cities since the pandemic. For instance, in Santa Maria, rent increased by 40.9%, in Bakersfield by 39.4%, in Fresno by 38%, and in Riverside by 37.5%.  The Affordable Rent Act, AB 1157, is co-authored by Assemblymembers Mia Bonta (D-Oakland), Isaac Bryan (D-Los Angeles), Sade Elhawary (D-South Los Angeles), Robert Garcia (D-Rancho Cucamonga), Corey Jackson (D-Moreno Valley), Alex Lee (D-San José), Tina McKinnor (D-Inglewood), and Liz Ortega (D-San Leandro) and Senator Smallwood-Cuevas (D-Los Angeles). The bill is co-sponsored by the Alliance of Californians for Community Empowerment (ACCE), Housing Now! CA, PICO California, Public Advocates, and UNITE HERE Local 11.  ### Assemblymember Ash Kalra represents California’s 25th Assembly District, which encompasses the majority of San José, including downtown and open space areas in southeast Santa Clara County. He was first elected in 2016, becoming the first Indian American to serve in the California Legislature in state history, and was re-elected to his fifth term in 2024. Assemblymember Kalra is the Chair of the Committee on Judiciary and also serves as a member on the Housing & Community Development, Labor & Employment, Natural Resources, and Utilities & Energy committees.

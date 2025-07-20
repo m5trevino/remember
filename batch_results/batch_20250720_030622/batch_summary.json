@@ -1,0 +1,11 @@
+{
+  "batch_session": "batch_20250720_030622",
+  "analysis_prompt": "\ud83d\udccb Analysis Prompt: \ud83d\udccb tpa_defense_analysis  Size: ~1700 characters Purpose: Extract every strategic legal angle supporting your defense under the California Tenant Protection Act (TPA) based on verified testimony. \ud83d\udd0d LE... SYSTEM \u23f3 Starting batch processing... Responses will stream in real-time. SYSTEM \u2705 Batch complete! Processed: 0/164 (0.0% success)",
+  "model_used": "deepseek-r1-distill-llama-70b",
+  "total_documents": 247,
+  "processed_successfully": 0,
+  "failed_documents": 247,
+  "batch_directory": "/home/flintx/remember/batch_results/batch_20250720_030622",
+  "timestamp": "2025-07-20T03:06:25.931722",
+  "results": []
+}
