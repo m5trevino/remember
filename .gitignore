@@ -3,8 +3,9 @@ api_key_manager.py
 .env
 
 # Generated data, logs, and other large directories
+.db/**/*
+!.db/**/.gitkeep
 batch_results/
-extractions/
 llm_logs/
 llm_responses/
 notes/
@@ -19,3 +20,8 @@ __pycache__/
 
 # A file you previously wanted to ignore
 "cfonts 'LEGAL|WAR ROOM' -f pallet -g yellow,re.py"
+
+# Ignore environment files
+.env
+.env.*
+*.env
